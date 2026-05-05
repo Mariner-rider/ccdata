@@ -58,3 +58,7 @@ Read-only API endpoints: `/metrics/summary`, `/sources/freshness`, `/jobs/failur
 - Public/search-serving data now lives in `public_entities`, not `crawler_records`.
 - `publish:entity` writes/updates `public_entities` while preserving publish history in `published_records`.
 - `index:rebuild` safely rebuilds public index from latest published versions.
+
+## Phase 20 categories
+Public indexing/publish now supports: college, institute, admission, job, scholarship, news, education_loan.
+Search/public list filters: `entity_type`, `country`, `location`.

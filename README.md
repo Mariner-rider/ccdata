@@ -175,3 +175,10 @@ Use `LOG_FORMAT=json` for structured operational logs.
 - Slugs are stable (`title-location`) with uniqueness suffixes (`-2`, `-3`).
 - Reindex command: `python -m services.lite_pipeline.main index:rebuild`.
 - Public endpoints: `GET /public/entities`, `GET /public/entities/{slug}`, search via `GET /search?q=...` over published entities only.
+
+## Phase 20 Multi-category support
+Supported public entity types: college, institute, admission, job, scholarship, news, education_loan.
+Search examples:
+- `python -m services.lite_pipeline.main search --query "MBA" --entity-type admission`
+- `python -m services.lite_pipeline.main search --query "scholarship" --entity-type scholarship`
+- `python -m services.lite_pipeline.main search --query "loan" --country India`

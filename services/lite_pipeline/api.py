@@ -74,12 +74,12 @@ def failures(): return jobs_failures()
 def quality(): return quality_report_summary()
 
 @app.get('/search')
-def search(q:str, entity_type:str|None=None, location:str|None=None):
-    return {"results":_search(q,entity_type,location)}
+def search(q:str, entity_type:str|None=None, location:str|None=None, country:str|None=None):
+    return {"results":_search(q,entity_type,location,country)}
 
 @app.get('/public/entities')
-def public_entities():
-    return {"results":public_entities_list()}
+def public_entities(entity_type:str|None=None, country:str|None=None, location:str|None=None):
+    return {"results":public_entities_list(entity_type,country,location)}
 
 @app.get('/public/entities/{slug}')
 def public_entity(slug:str):

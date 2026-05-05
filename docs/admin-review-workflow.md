@@ -40,3 +40,6 @@ Use metrics and quality reports to track draft/review/published counts and missi
 - Review/approval still acts on crawler records.
 - Only published records are materialized into `public_entities` for public pages and search.
 - This prevents raw extraction payloads from leaking to public APIs.
+
+## Multi-category public flow
+Approved records from all supported entity types are published into `public_entities` with category-specific `page_json` shapes.

@@ -18,6 +18,15 @@ except Exception:
 
 TRUST={"official":1.0,"government/regulator":0.95,"recognized news":0.75,"aggregator":0.60,"user/review":0.40}
 REQ_COLLEGE=["name","location","official_website","courses","fees","admission_link","placement","faculty","hostel"]
+REQ_BY_TYPE={
+    'college':REQ_COLLEGE,
+    'institute':['name','location','courses','fees','contact'],
+    'admission':['institution_name','program','application_deadline','apply_link','eligibility'],
+    'job':['title','organization','location','deadline','apply_link','eligibility'],
+    'scholarship':['scholarship_name','provider','eligibility','amount','deadline','apply_link'],
+    'news':['title','published_date','source','category','summary','url'],
+    'education_loan':['bank_name','loan_type','interest_rate','eligibility','max_amount','apply_link'],
+}
 KEYWORDS=["admission","admissions","programme","program","academics","departments","courses","fees","fee-structure","fee","placement","placements","career-development","career","faculty","people","hostel","campus-life","infrastructure","scholarship","contact","directory","about","overview"]
 LABELS=["Faculty:","Hostel:","Placement:","Contact:","Fees:","Courses:","Address:","Location:","Admission:"]
 GENERIC_HEADINGS={"courses & fees","courses and fees","placements","placement","faculty","hostel","contact","admissions","admission","gallery","infrastructure","about","overview","reviews","scholarships"}
@@ -182,6 +191,23 @@ def discover(seed,cfg,repo=None):
     return [{"url":seed,"page_type":"homepage","priority":99,"reason":"seed","robots_allowed":seed_ok,"robots_reason":seed_reason}]+cand[:cfg.max_pages-1]
 
 def merge_pages(entity_type,name,official_url,pages,trust):
+    if entity_type!='college':
+        raw=' '.join(str(p.get('extract',{}).get('raw_text','')) for p in pages)
+        def g(k):
+            import re
+            m=re.search(rf'{k}\\s*:\\s*(.+)',raw,re.I); return m.group(1).strip() if m else ''
+        fmap={
+            'institute':{'name':g('Name') or name,'location':g('Location'),'courses':[g('Courses')] if g('Courses') else [],'fees':[g('Fees')] if g('Fees') else [],'contact':[g('Contact')] if g('Contact') else []},
+            'admission':{'institution_name':g('Institution Name'),'program':g('Program'),'application_start_date':g('Application Start Date'),'application_deadline':g('Application Deadline'),'apply_link':g('Apply Link'),'eligibility':g('Eligibility')},
+            'job':{'title':g('Title') or name,'organization':g('Organization'),'location':g('Location'),'deadline':g('Deadline'),'apply_link':g('Apply Link'),'eligibility':g('Eligibility')},
+            'scholarship':{'scholarship_name':g('Scholarship Name') or name,'provider':g('Provider'),'eligibility':g('Eligibility'),'amount':g('Amount'),'deadline':g('Deadline'),'apply_link':g('Apply Link')},
+            'news':{'title':g('Title') or name,'published_date':g('Published Date'),'source':g('Source'),'category':g('Category'),'summary':g('Summary'),'url':g('URL')},
+            'education_loan':{'bank_name':g('Bank Name') or name,'loan_type':g('Loan Type'),'interest_rate':g('Interest Rate'),'eligibility':g('Eligibility'),'max_amount':g('Max Amount'),'apply_link':g('Apply Link')},
+        }
+        fields=fmap.get(entity_type,{})
+        missing=[f for f in REQ_BY_TYPE.get(entity_type,[]) if not fields.get(f)]
+        conf=round((1-len(missing)/max(1,len(REQ_BY_TYPE.get(entity_type,[]))))*0.7+0.3,3)
+        return {"entity_type":entity_type,"title":name,"source_url":official_url,"official_url":official_url,"fields":fields,"metadata":{"field_sources":{},"page_count":len(pages)},"missing_fields":missing,"confidence_score":conf,"trust_tier":trust,"content_hash":hashlib.sha256(json.dumps(fields,sort_keys=True).encode()).hexdigest(),"last_crawled_at":datetime.now(timezone.utc).isoformat()}
     headings={"courses","course","placement","placements","faculty","hostel","fees","admission","contact","gallery","courses & fees"}
     merged={"name":name,"official_website":official_url,"location":"","courses":[],"fees":[],"admission_link":[],"placement":[],"faculty":[],"hostel":[],"gallery":[],"contact":[]}
     fs={}
@@ -219,7 +245,13 @@ def _fetch_extract_resilient(url, timeout=15):
                 if code==429: raise RuntimeError('cooldown:429')
                 if code>=500: raise RuntimeError(f'server_error:{code}')
             if _px and os.getenv('CRAWL_SIMULATE_PROXY_FAIL','false').lower()=='true': raise RuntimeError('proxy_failed')
-            return extract_fallback(url, timeout=timeout)
+            ex=extract_fallback(url, timeout=timeout)
+            if url.startswith('file://') and not ex.get('raw_text'):
+                p=urlparse(url)
+                path=(p.netloc+p.path).lstrip('/')
+                try: ex['raw_text']=Path(path).read_text(encoding='utf-8')
+                except Exception: pass
+            return ex
         except Exception as e:
             msg=str(e)
             if 'blocked:403' in msg or 'cooldown:429' in msg: raise
@@ -233,15 +265,16 @@ def _canonical_sig(rec):
     dom=urlparse(rec.get('official_url') or rec.get('source_url') or '').netloc.lower()
     return hashlib.sha1(f'{nm}|{loc}|{dom}'.encode()).hexdigest()
 
-def _search(query, entity_type=None, location=None):
+def _search(query, entity_type=None, location=None, country=None):
     q=(query or '').lower(); out=[]
     with sqlite3.connect(Repo(_cfg().database_url).path) as c: rows=c.execute('select id,entity_type,title,location,country,summary,search_text from public_entities where lifecycle_state=\"published\"').fetchall()
-    for rid,et,title,loc,country,summary,search_text in rows:
-        text=' '.join([str(title or ''),str(loc or ''),str(country or ''),str(summary or ''),str(search_text or '')]).lower()
+    for rid,et,title,loc,row_country,summary,search_text in rows:
+        text=' '.join([str(title or ''),str(loc or ''),str(row_country or ''),str(summary or ''),str(search_text or '')]).lower()
         if q and q not in text: continue
         if entity_type and et!=entity_type: continue
         if location and location.lower() not in str(loc or '').lower(): continue
-        out.append({'id':rid,'entity_type':et,'title':title,'location':loc or '','country':country or '','summary':summary or '','score':text.count(q) if q else 1})
+        if country and country.lower() not in str(row_country or '').lower(): continue
+        out.append({'id':rid,'entity_type':et,'title':title,'location':loc or '','country':row_country or '','summary':summary or '','score':text.count(q) if q else 1})
     return sorted(out,key=lambda x:(x['score'],x['id']),reverse=True)
 
 def _slugify(title, location):
@@ -256,8 +289,17 @@ def _upsert_public_entity(c, entity_record_id, source_id, entity_type, rec, vers
     location=fields.get('location','')
     country=fields.get('country','')
     summary=f"{title} in {location}".strip()
-    search_text=' '.join([title,location,country,' '.join(fields.get('courses',[]) if isinstance(fields.get('courses'),list) else []),summary]).strip()
-    page_json=json.dumps({'title':title,'location':location,'country':country,'courses':fields.get('courses',[]),'summary':summary})
+    if entity_type=='college':
+        page={'info':rec.get('info',{}),'courses_and_fees':rec.get('courses_and_fees',{}),'faculty':rec.get('faculty',[]),'hostel':rec.get('hostel',[]),'placement':rec.get('placement',[]),'gallery':rec.get('gallery',[]),'metadata':rec.get('metadata',{})}
+        st=' '.join([title,location,' '.join(fields.get('courses',[]) if isinstance(fields.get('courses'),list) else []),summary])
+    elif entity_type=='institute':
+        page={'info':{'name':fields.get('name',title),'location':fields.get('location','')},'courses_and_fees':{'courses':fields.get('courses',[]),'fees':fields.get('fees',[])},'contact':fields.get('contact',[]),'reviews':rec.get('reviews',[]),'metadata':rec.get('metadata',{})}
+        st=' '.join([title,fields.get('location',''),' '.join(fields.get('courses',[]))])
+    else:
+        page={k:fields.get(k) for k in fields}; page['metadata']=rec.get('metadata',{})
+        st=' '.join([str(v) for v in fields.values() if isinstance(v,str)])
+    search_text=' '.join([st,country,summary]).strip()
+    page_json=json.dumps(page)
     slug=_slugify(title,location)
     row=c.execute('select id,slug from public_entities where entity_record_id=?',(entity_record_id,)).fetchone()
     if row: slug=row[1]
@@ -286,7 +328,11 @@ def crawl_source(id,dry=False):
     with sqlite3.connect(repo.path) as c:
         dup=c.execute('select id from crawler_records where canonical_entity_id=? and source_id!=? limit 1',(rec['canonical_entity_id'],sid)).fetchone()
     if dup: rec['duplicate_of']=dup[0]
-    valid=rec['confidence_score']>=0.65 and (1-len(rec['missing_fields'])/len(REQ_COLLEGE))>=0.7 and rec['trust_tier'] in TRUST and rec['content_hash']
+    req=REQ_BY_TYPE.get(etype,REQ_COLLEGE)
+    if etype=='college':
+        valid=rec['confidence_score']>=0.65 and (1-len(rec['missing_fields'])/max(1,len(req)))>=0.7 and rec['trust_tier'] in TRUST and rec['content_hash']
+    else:
+        valid=bool(rec.get('content_hash')) and rec['trust_tier'] in TRUST
     qr=quality_report(plan,pages,rec,'pass' if valid else 'fail','quality_gate_failed' if not valid else '')
     if dry: return {"dry_run":True,"quality_report":qr,"record":rec}
     st=repo.save_entity(rec) if valid else (repo.save_quarantine(url,rec,'quality_gate_failed') or 'quarantined')
@@ -404,10 +450,14 @@ def index_rebuild():
         c.commit()
     return {'ok':True,'rebuilt':rebuilt}
 
-def public_entities_list():
+def public_entities_list(entity_type=None,country=None,location=None):
     with sqlite3.connect(Repo(_cfg().database_url).path) as c:
         rows=c.execute("select id,entity_type,title,slug,location,country,summary,published_version from public_entities where lifecycle_state='published' order by id desc").fetchall()
-    return [{'id':r[0],'entity_type':r[1],'title':r[2],'slug':r[3],'location':r[4],'country':r[5],'summary':r[6],'published_version':r[7]} for r in rows]
+    out=[{'id':r[0],'entity_type':r[1],'title':r[2],'slug':r[3],'location':r[4],'country':r[5],'summary':r[6],'published_version':r[7]} for r in rows]
+    if entity_type: out=[x for x in out if x['entity_type']==entity_type]
+    if country: out=[x for x in out if country.lower() in (x['country'] or '').lower()]
+    if location: out=[x for x in out if location.lower() in (x['location'] or '').lower()]
+    return out
 
 def public_entity_get(slug):
     with sqlite3.connect(Repo(_cfg().database_url).path) as c:
@@ -727,7 +777,7 @@ def main():
     sub.add_parser('integrity:check')
     ir=sub.add_parser('integrity:repair'); ir.add_argument('--dry-run',action='store_true'); ir.add_argument('--apply',action='store_true')
     a=sub.add_parser('source:add'); a.add_argument('--entity-type',required=True); a.add_argument('--entity-name',required=True); a.add_argument('--url',required=True); a.add_argument('--trust-tier',default='official'); a.add_argument('--trigger-crawl',action='store_true')
-    s=sub.add_parser('search'); s.add_argument('--query',required=True); s.add_argument('--entity-type',default=None); s.add_argument('--location',default=None)
+    s=sub.add_parser('search'); s.add_argument('--query',required=True); s.add_argument('--entity-type',default=None); s.add_argument('--location',default=None); s.add_argument('--country',default=None)
     sub.add_parser('source:list')
     p=sub.add_parser('source:preview'); p.add_argument('--id',type=int,required=True)
     c=sub.add_parser('source:crawl'); c.add_argument('--id',type=int,required=True); c.add_argument('--dry-run',action='store_true')
@@ -774,7 +824,7 @@ def main():
     elif args.cmd=='source:add':
         sid=repo.add_source(vars(args)); print('added', sid)
         if args.trigger_crawl: print(json.dumps(enqueue_job(sid,'crawl',False,5),indent=2))
-    elif args.cmd=='search': print(json.dumps(_search(args.query,args.entity_type,args.location),indent=2))
+    elif args.cmd=='search': print(json.dumps(_search(args.query,args.entity_type,args.location,args.country),indent=2))
     elif args.cmd=='source:list': print(json.dumps([{"id":r[0],"entity_type":r[1],"entity_name":r[2],"official_url":r[3],"trust_tier":r[4],"is_active":r[5]} for r in repo.list_sources()],indent=2))
     elif args.cmd=='source:preview': s=repo.get_source(args.id); plan=discover(s[3],_cfg(),repo); print(json.dumps({"source_id":args.id,"estimated_page_count":len(plan),"urls":plan,"quality_report":{"pages_discovered":len(plan)}},indent=2))
     elif args.cmd=='source:crawl': print(json.dumps(crawl_source(args.id,args.dry_run),indent=2))
