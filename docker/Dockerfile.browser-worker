@@ -1,0 +1,7 @@
+FROM python:3.12-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends libnss3 libx11-6 libxcomposite1 libxrandr2 libgbm1 libgtk-3-0 ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY services/requirements-browser.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt && playwright install chromium
+COPY services /app/services
+CMD ["python", "-m", "services.parser_engine.main"]
