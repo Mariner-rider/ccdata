@@ -108,3 +108,22 @@ Use source registry CLI:
 - `python -m services.lite_pipeline.main source:list`
 - `python -m services.lite_pipeline.main source:crawl-active`
 Safe limits via env: CRAWL_MAX_PAGES_PER_SOURCE, CRAWL_MAX_DEPTH, CRAWL_RATE_LIMIT_SECONDS, CRAWL_TIMEOUT_SECONDS, CRAWL_SAME_DOMAIN_ONLY.
+
+## Phase 7 robustness
+- Use `source:preview --id <id>` to inspect prioritized crawl URLs, page type, robots decision, and estimated page count.
+- Use `source:crawl --id <id> --dry-run` to fetch/merge without DB writes.
+- Multi-page crawl merges into one entity profile and removes heading-only pollution in list fields.
+- Quality gate routes low-quality records to `quarantine_records`.
+- Export page-ready JSON with `export:entity --id <id> --format json`.
+
+## Phase 8 pilot readiness
+- Pilot run: `python -m services.lite_pipeline.main pilot:college --name "IIM Bangalore" --url https://www.iimb.ac.in --dry-run`.
+- Add `--save` to persist merged entity.
+- Configure `CRAWL_ALLOWED_DOMAINS=example.edu,example.ac.in` for safe allowlist control.
+- Compliance logs include robots decisions, skipped URLs (binary/cross-domain/allowlist), and extraction errors.
+
+## Phase 9 production hardening
+- HTTP smoke dry-run: `python -m services.lite_pipeline.main pilot:http-smoke --url https://example.edu --name "Example"`.
+- Validate export: `python -m services.lite_pipeline.main export:validate --id 1`.
+- Readiness: `python -m services.lite_pipeline.main readiness:check`.
+- Audit export: `python -m services.lite_pipeline.main audit:export --format json`.
