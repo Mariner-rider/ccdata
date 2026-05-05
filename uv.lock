@@ -1,0 +1,4 @@
+# Placeholder lockfile for uv-based sync in restricted environments.
+# Regenerate in developer environment with:
+#   uv lock
+#   uv sync --extra dev
