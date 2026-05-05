@@ -152,3 +152,11 @@ Idempotency: pass `Idempotency-Key` header for publish/sync.
 - Failure controls: `MAX_FAILED_JOBS_PER_SOURCE`, `CRAWL_COOLDOWN_HOURS_AFTER_FAILURE`.
 - Retry policy: exponential backoff with `retry_count` and `next_retry_at`.
 - Stale running recovery: `JOB_STALE_MINUTES`.
+
+## Phase 16 observability
+Commands:
+- `metrics:summary`
+- `sources:freshness`
+- `jobs:failures`
+- `quality:report`
+Use `LOG_FORMAT=json` for structured operational logs.

@@ -45,3 +45,6 @@ Job lifecycle: queued -> running -> completed/failed/cancelled via `crawl_jobs` 
 
 ## Phase 15
 Scheduler enforces due-date + budgets + cooldown and worker retries failed jobs with backoff; stale running jobs are recovered.
+
+## Phase 16 observability
+Read-only API endpoints: `/metrics/summary`, `/sources/freshness`, `/jobs/failures`, `/quality/report`.

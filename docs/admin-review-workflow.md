@@ -32,3 +32,6 @@ Auto-publishing remains disabled by design.
 - `db:migrate` / `db:status`
 - direct API key protection on write endpoints (`X-API-Key`)
 - idempotent publish/sync via idempotency key
+
+## Monitoring review/publish ops
+Use metrics and quality reports to track draft/review/published counts and missing-field trends.

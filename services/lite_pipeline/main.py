@@ -96,8 +96,8 @@ class Repo:
     def __init__(self,db): self.path=db.replace("sqlite:///","")
     def init(self):
         with sqlite3.connect(self.path) as c:
-            c.execute("CREATE TABLE IF NOT EXISTS source_registry(id INTEGER PRIMARY KEY,entity_type TEXT,entity_name TEXT,official_url TEXT,trust_tier TEXT,is_active INTEGER DEFAULT 1,last_crawled_at TEXT,crawl_frequency_days INTEGER DEFAULT 7)")
-            c.execute("CREATE TABLE IF NOT EXISTS crawler_records(id INTEGER PRIMARY KEY,entity_type TEXT,title TEXT,source_url TEXT UNIQUE,official_url TEXT,payload TEXT,missing_fields TEXT,confidence_score REAL,trust_tier TEXT,content_hash TEXT,last_crawled_at TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS source_registry(id INTEGER PRIMARY KEY,entity_type TEXT,entity_name TEXT,official_url TEXT,trust_tier TEXT,is_active INTEGER DEFAULT 1,last_crawled_at TEXT,crawl_frequency_days INTEGER DEFAULT 7,updated_at TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS crawler_records(id INTEGER PRIMARY KEY,source_id INTEGER,entity_type TEXT,title TEXT,source_url TEXT UNIQUE,official_url TEXT,payload TEXT,missing_fields TEXT,confidence_score REAL,trust_tier TEXT,content_hash TEXT,last_crawled_at TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS quarantine_records(id INTEGER PRIMARY KEY,source_url TEXT,payload TEXT,reason TEXT,created_at TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS crawl_logs(id INTEGER PRIMARY KEY,source_url TEXT,status TEXT,detail TEXT,event_ts TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS review_queue(id INTEGER PRIMARY KEY,entity_record_id INTEGER,entity_type TEXT,title TEXT,confidence_score REAL,missing_fields TEXT,quality_gate_status TEXT,suggested_action TEXT,created_at TEXT,reviewed_at TEXT,reviewed_by TEXT,decision TEXT,notes TEXT)")
@@ -110,7 +110,7 @@ class Repo:
             except Exception: pass
             try: c.execute('ALTER TABLE chatbot_sync_logs ADD COLUMN idempotency_key TEXT')
             except Exception: pass
-            for q in ["ALTER TABLE source_registry ADD COLUMN last_crawled_at TEXT","ALTER TABLE source_registry ADD COLUMN crawl_frequency_days INTEGER DEFAULT 7","ALTER TABLE crawl_jobs ADD COLUMN retry_count INTEGER DEFAULT 0","ALTER TABLE crawl_jobs ADD COLUMN next_retry_at TEXT","ALTER TABLE crawl_jobs ADD COLUMN last_error TEXT"]:
+            for q in ["ALTER TABLE source_registry ADD COLUMN last_crawled_at TEXT","ALTER TABLE source_registry ADD COLUMN crawl_frequency_days INTEGER DEFAULT 7","ALTER TABLE source_registry ADD COLUMN updated_at TEXT","ALTER TABLE crawl_jobs ADD COLUMN retry_count INTEGER DEFAULT 0","ALTER TABLE crawl_jobs ADD COLUMN next_retry_at TEXT","ALTER TABLE crawl_jobs ADD COLUMN last_error TEXT","ALTER TABLE crawler_records ADD COLUMN source_id INTEGER","ALTER TABLE published_records ADD COLUMN source_id INTEGER","ALTER TABLE chatbot_sync_logs ADD COLUMN source_id INTEGER"]:
                 try: c.execute(q)
                 except Exception: pass
             c.commit()
@@ -130,7 +130,7 @@ class Repo:
                 c.execute("UPDATE crawler_records SET payload=?,missing_fields=?,confidence_score=?,content_hash=?,last_crawled_at=? WHERE id=?",(json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['content_hash'],rec['last_crawled_at'],row[0])); c.commit(); return 'updated'
             state='draft' if (not rec['missing_fields'] and rec['confidence_score']>=0.85) else 'needs_review'
             rec['lifecycle_state']=state
-            c.execute("INSERT INTO crawler_records(entity_type,title,source_url,official_url,payload,missing_fields,confidence_score,trust_tier,content_hash,last_crawled_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(rec['entity_type'],rec['title'],rec['source_url'],rec['official_url'],json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['trust_tier'],rec['content_hash'],rec['last_crawled_at']))
+            c.execute("INSERT INTO crawler_records(source_id,entity_type,title,source_url,official_url,payload,missing_fields,confidence_score,trust_tier,content_hash,last_crawled_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(rec.get('source_id'),rec['entity_type'],rec['title'],rec['source_url'],rec['official_url'],json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['trust_tier'],rec['content_hash'],rec['last_crawled_at']))
             rid=c.execute('select last_insert_rowid()').fetchone()[0]
             if state=='needs_review':
                 c.execute("INSERT INTO review_queue(entity_record_id,entity_type,title,confidence_score,missing_fields,quality_gate_status,suggested_action,created_at) VALUES(?,?,?,?,?,?,?,?)",(rid,rec['entity_type'],rec['title'],rec['confidence_score'],json.dumps(rec['missing_fields']),'fail','review',datetime.now(timezone.utc).isoformat()))
@@ -138,7 +138,7 @@ class Repo:
     def save_quarantine(self,source_url,payload,reason):
         with sqlite3.connect(self.path) as c: c.execute("INSERT INTO quarantine_records(source_url,payload,reason,created_at) VALUES(?,?,?,?)",(source_url,json.dumps(payload),reason,datetime.now(timezone.utc).isoformat())); c.commit()
     def get_entity(self,id):
-        with sqlite3.connect(self.path) as c: r=c.execute("SELECT payload FROM crawler_records WHERE id=?",(id,)).fetchone(); return json.loads(r[0]) if r else None
+        with sqlite3.connect(self.path) as c: r=c.execute("SELECT payload,source_id FROM crawler_records WHERE id=?",(id,)).fetchone(); return json.loads(r[0]) if r else None
 
 def _strip_label(s):
     x=" ".join(str(s).split()).strip()
@@ -200,11 +200,14 @@ def crawl_source(id,dry=False):
         if not p['robots_allowed']: repo.log(p['url'],'blocked','robots'); continue
         try: pages.append({"url":p['url'],"extract":extract_fallback(p['url'], timeout=cfg.timeout),"page_type":p['page_type']})
         except Exception as e: repo.log(p['url'],'error',str(e))
-    rec=merge_pages(etype,name,url,pages,trust)
+    rec=merge_pages(etype,name,url,pages,trust); rec['source_id']=sid
     valid=rec['confidence_score']>=0.65 and (1-len(rec['missing_fields'])/len(REQ_COLLEGE))>=0.7 and rec['trust_tier'] in TRUST and rec['content_hash']
     qr=quality_report(plan,pages,rec,'pass' if valid else 'fail','quality_gate_failed' if not valid else '')
     if dry: return {"dry_run":True,"quality_report":qr,"record":rec}
     st=repo.save_entity(rec) if valid else (repo.save_quarantine(url,rec,'quality_gate_failed') or 'quarantined')
+    if st in {'created','updated','unchanged'}:
+        with sqlite3.connect(repo.path) as c:
+            c.execute('UPDATE source_registry SET last_crawled_at=?,updated_at=? WHERE id=?',(datetime.now(timezone.utc).isoformat(),datetime.now(timezone.utc).isoformat(),sid)); c.commit()
     return {"source_id":sid,"status":st,"quality_report":qr}
 
 def export_entity(eid): repo=Repo(_cfg().database_url); repo.init(); return repo.get_entity(eid)
@@ -278,16 +281,16 @@ def review_decide(i,decision,reviewed_by,notes=''):
         r=c.execute("SELECT entity_record_id FROM review_queue WHERE id=?",(i,)).fetchone()
         if not r: raise RuntimeError('review not found')
         c.execute("UPDATE review_queue SET reviewed_at=?,reviewed_by=?,decision=?,notes=? WHERE id=?",(datetime.now(timezone.utc).isoformat(),reviewed_by,decision,notes,i))
-        pr=c.execute("SELECT payload FROM crawler_records WHERE id=?",(r[0],)).fetchone(); rec=json.loads(pr[0]); rec['lifecycle_state']='approved' if decision=='approved' else 'rejected'
+        pr=c.execute("SELECT payload,source_id FROM crawler_records WHERE id=?",(r[0],)).fetchone(); rec=json.loads(pr[0]); src_id=pr[1]; rec['lifecycle_state']='approved' if decision=='approved' else 'rejected'
         c.execute("UPDATE crawler_records SET payload=? WHERE id=?",(json.dumps(rec),r[0])); c.commit()
     return {'ok':True,'decision':decision}
 
 def publish_entity(i,idempotency_key=None):
     repo=Repo(_cfg().database_url); repo.init()
     with sqlite3.connect(repo.path) as c:
-        pr=c.execute("SELECT payload FROM crawler_records WHERE id=?",(i,)).fetchone();
+        pr=c.execute("SELECT payload,source_id FROM crawler_records WHERE id=?",(i,)).fetchone();
         if not pr: raise RuntimeError('record not found')
-        rec=json.loads(pr[0])
+        rec=json.loads(pr[0]); src_id=pr[1]
         if rec.get('lifecycle_state')!='approved':
             raise RuntimeError(f"invalid state: {rec.get('lifecycle_state')}; next_action=record:approve")
         if idempotency_key:
@@ -296,7 +299,8 @@ def publish_entity(i,idempotency_key=None):
         v=(c.execute("SELECT COALESCE(MAX(version),0) FROM published_records WHERE entity_record_id=?",(i,)).fetchone()[0])+1
         rec['lifecycle_state']='published'
         c.execute("UPDATE crawler_records SET payload=? WHERE id=?",(json.dumps(rec),i))
-        c.execute("INSERT INTO published_records(entity_record_id,version,payload,published_at,idempotency_key) VALUES(?,?,?,?,?)",(i,v,json.dumps(rec),datetime.now(timezone.utc).isoformat(),idempotency_key)); c.commit()
+        c.execute("INSERT INTO published_records(entity_record_id,source_id,version,payload,published_at,idempotency_key) VALUES(?,?,?,?,?,?)",(i,src_id,v,json.dumps(rec),datetime.now(timezone.utc).isoformat(),idempotency_key)); c.commit()
+    _log_event('publish_completed',entity_id=i,version=v)
     return {'entity_id':i,'version':v,'status':'published'}
 
 def publish_list():
@@ -305,13 +309,14 @@ def publish_list():
 
 def chatbot_sync(eid,idempotency_key=None):
     with sqlite3.connect(Repo(_cfg().database_url).path) as c:
-        r=c.execute("SELECT version,payload FROM published_records WHERE entity_record_id=? ORDER BY version DESC LIMIT 1",(eid,)).fetchone()
+        r=c.execute("SELECT version,payload,source_id FROM published_records WHERE entity_record_id=? ORDER BY version DESC LIMIT 1",(eid,)).fetchone()
         if not r: raise RuntimeError('not published; next_action=publish:entity')
         if idempotency_key:
             ex=c.execute("SELECT id,published_version,status FROM chatbot_sync_logs WHERE entity_record_id=? AND idempotency_key=? ORDER BY id DESC LIMIT 1",(eid,idempotency_key)).fetchone()
             if ex: return {'entity_id':eid,'published_version':ex[1],'status':ex[2],'idempotent':True}
-        rec=json.loads(r[1]); fields=list(rec.get('fields',{}).keys())
-        c.execute("INSERT INTO chatbot_sync_logs(entity_record_id,title,published_version,fields_synced,status,created_at,idempotency_key) VALUES(?,?,?,?,?,?,?)",(eid,rec.get('title'),r[0],json.dumps(fields),'queued',datetime.now(timezone.utc).isoformat(),idempotency_key)); c.commit()
+        rec=json.loads(r[1]); src_id=r[2]; fields=list(rec.get('fields',{}).keys())
+        c.execute("INSERT INTO chatbot_sync_logs(entity_record_id,source_id,title,published_version,fields_synced,status,created_at,idempotency_key) VALUES(?,?,?,?,?,?,?,?)",(eid,src_id,rec.get('title'),r[0],json.dumps(fields),'queued',datetime.now(timezone.utc).isoformat(),idempotency_key)); c.commit()
+    _log_event('chatbot_sync_queued',entity_id=eid,version=r[0])
     return {'entity_id':eid,'published_version':r[0],'fields_synced':fields,'status':'queued'}
 
 
@@ -338,7 +343,7 @@ def review_seed(entity_id):
     with sqlite3.connect(repo.path) as c:
         pr=c.execute('SELECT payload,entity_type,title,confidence_score,missing_fields FROM crawler_records WHERE id=?',(entity_id,)).fetchone()
         if not pr: raise RuntimeError('record not found')
-        rec=json.loads(pr[0]); st=rec.get('lifecycle_state')
+        rec=json.loads(pr[0]); src_id=pr[1]; st=rec.get('lifecycle_state')
         if st not in {'draft','needs_review','approved'}: raise RuntimeError('seed only for draft/needs_review')
         ex=c.execute('SELECT id FROM review_queue WHERE entity_record_id=?',(entity_id,)).fetchone()
         if not ex:
@@ -348,9 +353,9 @@ def review_seed(entity_id):
 def record_approve(entity_id,reviewed_by,force=False):
     repo=Repo(_cfg().database_url); repo.init()
     with sqlite3.connect(repo.path) as c:
-        pr=c.execute('SELECT payload FROM crawler_records WHERE id=?',(entity_id,)).fetchone()
+        pr=c.execute('SELECT payload,source_id FROM crawler_records WHERE id=?',(entity_id,)).fetchone()
         if not pr: raise RuntimeError('record not found')
-        rec=json.loads(pr[0]); st=rec.get('lifecycle_state')
+        rec=json.loads(pr[0]); src_id=pr[1]; st=rec.get('lifecycle_state')
         if st=='rejected' and not force: raise RuntimeError('rejected requires --force')
         if st=='quarantine': raise RuntimeError('quarantine cannot be approved')
         rec['lifecycle_state']='approved'
@@ -362,9 +367,9 @@ def record_approve(entity_id,reviewed_by,force=False):
 def record_reject(entity_id,reviewed_by,notes=''):
     repo=Repo(_cfg().database_url); repo.init()
     with sqlite3.connect(repo.path) as c:
-        pr=c.execute('SELECT payload FROM crawler_records WHERE id=?',(entity_id,)).fetchone()
+        pr=c.execute('SELECT payload,source_id FROM crawler_records WHERE id=?',(entity_id,)).fetchone()
         if not pr: raise RuntimeError('record not found')
-        rec=json.loads(pr[0]); st=rec.get('lifecycle_state')
+        rec=json.loads(pr[0]); src_id=pr[1]; st=rec.get('lifecycle_state')
         if st=='published': raise RuntimeError('published cannot be rejected directly')
         rec['lifecycle_state']='rejected'
         c.execute('UPDATE crawler_records SET payload=? WHERE id=?',(json.dumps(rec),entity_id)); c.commit()
@@ -428,6 +433,7 @@ def worker_once():
         result=crawl_source(sid,bool(dry))
         with sqlite3.connect(repo.path) as c:
             c.execute("UPDATE crawl_jobs SET status='completed',result_json=?,completed_at=? WHERE id=?",(json.dumps(result),datetime.now(timezone.utc).isoformat(),jid)); c.commit()
+        _log_event('crawl_job_completed',job_id=jid,source_id=sid)
         return {'processed':1,'job_id':jid,'status':'completed'}
     except Exception as e:
         with sqlite3.connect(repo.path) as c:
@@ -436,7 +442,7 @@ def worker_once():
                 back=2**retry_count
                 nr=(datetime.now(timezone.utc)+timedelta(minutes=back)).isoformat()
                 c.execute("UPDATE crawl_jobs SET status='queued',retry_count=retry_count+1,last_error=?,next_retry_at=? WHERE id=?",(str(e),nr,jid))
-                c.commit(); return {'processed':1,'job_id':jid,'status':'retry_queued','retry_count':retry_count+1}
+                c.commit(); _log_event('crawl_job_failed',job_id=jid,retry_count=retry_count+1,error=str(e)); return {'processed':1,'job_id':jid,'status':'retry_queued','retry_count':retry_count+1}
             c.execute("UPDATE crawl_jobs SET status='failed',error_message=?,last_error=?,completed_at=? WHERE id=?",(str(e),str(e),datetime.now(timezone.utc).isoformat(),jid)); c.commit()
         return {'processed':1,'job_id':jid,'status':'failed'}
 
@@ -503,6 +509,97 @@ def scheduler_run_once():
     report['enqueued']=enq
     return report
 
+
+
+def _log_event(event, **data):
+    if os.getenv('LOG_FORMAT','').lower()=='json':
+        print(json.dumps({'event':event, **data, 'ts':datetime.now(timezone.utc).isoformat()}))
+
+def metrics_summary():
+    repo=Repo(_cfg().database_url); repo.init()
+    with sqlite3.connect(repo.path) as c:
+        total_sources=c.execute('select count(*) from source_registry').fetchone()[0]
+        active_sources=c.execute('select count(*) from source_registry where is_active=1').fetchone()[0]
+        jobs={k:c.execute(f"select count(*) from crawl_jobs where status='{k}'").fetchone()[0] for k in ['queued','running','completed','failed','cancelled']}
+        retry_queued=c.execute("select count(*) from crawl_jobs where status='queued' and retry_count>0").fetchone()[0]
+        quarantine=c.execute('select count(*) from quarantine_records').fetchone()[0]
+        review=c.execute('select count(*) from review_queue').fetchone()[0]
+        published=c.execute('select count(*) from published_records').fetchone()[0]
+        recs=[json.loads(r[0]) for r in c.execute('select payload from crawler_records').fetchall()]
+    due=len([r for r in sources_freshness() if r['freshness_status'] in {'due','never_crawled'}])
+    conf=[r.get('confidence_score',0) for r in recs] or [0]
+    fresh=sum(1 for r in recs if r.get('missing_fields')==[])
+    incomplete=sum(1 for r in recs if r.get('missing_fields'))
+    stale=max(0,total_sources-fresh-incomplete)
+    return {'total_sources':total_sources,'active_sources':active_sources,'due_sources':due,'total_jobs':sum(jobs.values()),'queued_jobs':jobs['queued'],'running_jobs':jobs['running'],'completed_jobs':jobs['completed'],'failed_jobs':jobs['failed'],'cancelled_jobs':jobs['cancelled'],'retry_queued_jobs':retry_queued,'quarantine_count':quarantine,'review_queue_count':review,'published_count':published,'avg_confidence_score':round(sum(conf)/len(conf),3),'fresh_records':fresh,'incomplete_records':incomplete,'stale_records':stale}
+
+def sources_freshness():
+    out=[]; now=datetime.now(timezone.utc)
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c:
+        rows=c.execute('select id,entity_name,entity_type,official_url,last_crawled_at,coalesce(crawl_frequency_days,7) from source_registry').fetchall()
+        for r in rows:
+            last=None if not r[4] else datetime.fromisoformat(r[4])
+            next_due=None if not last else (last+timedelta(days=int(r[5])))
+            status='never_crawled' if last is None else ('due' if next_due<=now else 'fresh')
+            lj=c.execute('select status,error_message from crawl_jobs where source_id=? order by id desc limit 1',(r[0],)).fetchone()
+            out.append({'id':r[0],'entity_name':r[1],'entity_type':r[2],'official_url':r[3],'last_crawled_at':r[4],'crawl_frequency_days':r[5],'next_due_at':next_due.isoformat() if next_due else None,'freshness_status':status,'last_job_status':lj[0] if lj else None,'last_error':lj[1] if lj else None})
+    return out
+
+def jobs_failures():
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c:
+        rows=c.execute("select source_id,count(*),max(last_error),max(retry_count),max(next_retry_at) from crawl_jobs where status='failed' or (status='queued' and retry_count>0) group by source_id").fetchall()
+    return [{'source_id':r[0],'failed_jobs':r[1],'last_error':r[2],'retry_count':r[3] or 0,'next_retry_at':r[4],'suggested_action':'inspect source or increase timeout'} for r in rows]
+
+def quality_report_summary():
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c:
+        recs=[json.loads(r[0]) for r in c.execute('select payload from crawler_records').fetchall()]
+    by_state={}; by_fresh={}; low=[]; missing=[]; top={}
+    for r in recs:
+        st=r.get('lifecycle_state','unknown'); by_state[st]=by_state.get(st,0)+1
+        fr='fresh' if not r.get('missing_fields') else 'incomplete'; by_fresh[fr]=by_fresh.get(fr,0)+1
+        if r.get('confidence_score',1)<0.75: low.append(r.get('title'))
+        if r.get('missing_fields'): missing.append({'title':r.get('title'),'missing_fields':r.get('missing_fields')})
+        et=r.get('entity_type','unknown'); top.setdefault(et,{})
+        for f in r.get('missing_fields',[]): top[et][f]=top[et].get(f,0)+1
+    return {'records_by_lifecycle_state':by_state,'records_by_freshness_status':by_fresh,'low_confidence_records':low,'records_with_missing_required_fields':missing,'top_missing_fields_by_entity_type':top}
+
+
+
+def integrity_check():
+    repo=Repo(_cfg().database_url); repo.init()
+    out={}
+    with sqlite3.connect(repo.path) as c:
+        out['records_without_source_id']=c.execute('select count(*) from crawler_records where source_id is null').fetchone()[0]
+        out['published_without_entity']=c.execute('select count(*) from published_records p left join crawler_records c on p.entity_record_id=c.id where c.id is null').fetchone()[0]
+        out['sync_without_published']=c.execute('select count(*) from chatbot_sync_logs s left join published_records p on s.entity_record_id=p.entity_record_id and s.published_version=p.version where p.id is null').fetchone()[0]
+        out['duplicate_active_sources_by_url']=c.execute('select count(*) from (select official_url,count(*) c from source_registry where is_active=1 group by official_url having c>1)').fetchone()[0]
+        out['source_last_crawled_mismatch']=c.execute("select count(*) from source_registry s where s.last_crawled_at is null and exists(select 1 from crawl_jobs j where j.source_id=s.id and j.status='completed')").fetchone()[0]
+    return out
+
+def integrity_repair(apply=False):
+    repo=Repo(_cfg().database_url); repo.init(); changes=[]
+    with sqlite3.connect(repo.path) as c:
+        rows=c.execute('select id,source_url from crawler_records where source_id is null').fetchall()
+        for rid,url in rows:
+            src=c.execute('select id from source_registry where official_url=? order by id limit 1',(url,)).fetchone()
+            if src:
+                changes.append({'record_id':rid,'source_id':src[0]})
+                if apply: c.execute('update crawler_records set source_id=? where id=?',(src[0],rid))
+        rows=c.execute("select s.id,max(j.completed_at) from source_registry s join crawl_jobs j on s.id=j.source_id and j.status='completed' group by s.id").fetchall()
+        for sid,last in rows:
+            cur=c.execute('select last_crawled_at from source_registry where id=?',(sid,)).fetchone()[0]
+            if (not cur) and last:
+                changes.append({'source_id':sid,'last_crawled_at':last})
+                if apply: c.execute('update source_registry set last_crawled_at=?,updated_at=? where id=?',(last,datetime.now(timezone.utc).isoformat(),sid))
+        dups=c.execute('select official_url from source_registry where is_active=1 group by official_url having count(*)>1').fetchall()
+        for (u,) in dups:
+            ids=[r[0] for r in c.execute('select id from source_registry where official_url=? and is_active=1 order by id',(u,)).fetchall()][1:]
+            for sid in ids:
+                changes.append({'deactivate_source_id':sid})
+                if apply: c.execute('update source_registry set is_active=0 where id=?',(sid,))
+        if apply: c.commit()
+    return {'dry_run':not apply,'changes':changes}
+
 def main():
     pa=argparse.ArgumentParser(); sub=pa.add_subparsers(dest='cmd',required=True)
     sub.add_parser('init-db')
@@ -515,6 +612,12 @@ def main():
     jca=sub.add_parser('jobs:cancel'); jca.add_argument('--id',type=int,required=True)
     sca=sub.add_parser('source:crawl-async'); sca.add_argument('--id',type=int,required=True); sca.add_argument('--dry-run',action='store_true'); sca.add_argument('--idempotency-key',default=None)
     sub.add_parser('scheduler:run-once')
+    sub.add_parser('metrics:summary')
+    sub.add_parser('sources:freshness')
+    sub.add_parser('jobs:failures')
+    sub.add_parser('quality:report')
+    sub.add_parser('integrity:check')
+    ir=sub.add_parser('integrity:repair'); ir.add_argument('--dry-run',action='store_true'); ir.add_argument('--apply',action='store_true')
     a=sub.add_parser('source:add'); a.add_argument('--entity-type',required=True); a.add_argument('--entity-name',required=True); a.add_argument('--url',required=True); a.add_argument('--trust-tier',default='official')
     sub.add_parser('source:list')
     p=sub.add_parser('source:preview'); p.add_argument('--id',type=int,required=True)
@@ -550,6 +653,12 @@ def main():
     elif args.cmd=='jobs:cancel': print(json.dumps(jobs_cancel(args.id),indent=2))
     elif args.cmd=='source:crawl-async': print(json.dumps(enqueue_job(args.id,'crawl',args.dry_run,5,None,args.idempotency_key),indent=2))
     elif args.cmd=='scheduler:run-once': print(json.dumps(scheduler_run_once(),indent=2))
+    elif args.cmd=='metrics:summary': print(json.dumps(metrics_summary(),indent=2))
+    elif args.cmd=='sources:freshness': print(json.dumps(sources_freshness(),indent=2))
+    elif args.cmd=='jobs:failures': print(json.dumps(jobs_failures(),indent=2))
+    elif args.cmd=='quality:report': print(json.dumps(quality_report_summary(),indent=2))
+    elif args.cmd=='integrity:check': print(json.dumps(integrity_check(),indent=2))
+    elif args.cmd=='integrity:repair': print(json.dumps(integrity_repair(apply=args.apply and not args.dry_run),indent=2))
     elif args.cmd=='source:add': print('added', repo.add_source(vars(args)))
     elif args.cmd=='source:list': print(json.dumps([{"id":r[0],"entity_type":r[1],"entity_name":r[2],"official_url":r[3],"trust_tier":r[4],"is_active":r[5]} for r in repo.list_sources()],indent=2))
     elif args.cmd=='source:preview': s=repo.get_source(args.id); plan=discover(s[3],_cfg(),repo); print(json.dumps({"source_id":args.id,"estimated_page_count":len(plan),"urls":plan,"quality_report":{"pages_discovered":len(plan)}},indent=2))

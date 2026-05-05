@@ -65,3 +65,6 @@ Use `source:crawl-async --id <id>`, then run `worker:once` and inspect with `job
 
 ## Scheduler report
 `scheduler:run-once` reports sources_checked, jobs_enqueued, skipped_not_due, skipped_budget, skipped_cooldown, failed_sources_blocked.
+
+## Observability and diagnostics
+Use metrics/freshness/failure/quality commands to monitor queue health, stale sources, and data quality trends.

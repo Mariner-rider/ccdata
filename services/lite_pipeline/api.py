@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 import os
-from services.lite_pipeline.main import Repo,_cfg,discover,crawl_source,export_entity,review_list,review_decide,publish_entity,chatbot_sync,record_approve,enqueue_job,job_get
+from services.lite_pipeline.main import Repo,_cfg,discover,crawl_source,export_entity,review_list,review_decide,publish_entity,chatbot_sync,record_approve,enqueue_job,job_get,metrics_summary,sources_freshness,jobs_failures,quality_report_summary
 
 app=FastAPI(title='collegecue-local-lite')
 ADMIN_API_KEY=os.getenv('ADMIN_API_KEY','')
@@ -59,3 +59,16 @@ def approve_record(id:int,reviewed_by:str='admin', x_api_key:str|None=Header(def
 @app.get('/jobs/{id}')
 def job(id:int):
     return job_get(id)
+
+
+@app.get('/metrics/summary')
+def metrics(): return metrics_summary()
+
+@app.get('/sources/freshness')
+def freshness(): return sources_freshness()
+
+@app.get('/jobs/failures')
+def failures(): return jobs_failures()
+
+@app.get('/quality/report')
+def quality(): return quality_report_summary()
