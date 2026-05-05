@@ -6,3 +6,12 @@
 4. normalize schema
 5. store normalized record with freshness fields
 6. trigger missing-field targeted crawl for official/trusted sources
+
+## CollegeCue mapping
+Crawler maps entities to CollegeCue normalized records with trust-tier and confidence score.
+
+## Extraction quality rules
+- Field-specific parsers use headings, lists, link text, regex and metadata.
+- Every field has confidence and method in `field_details`.
+- Missing-field checks require both empty/invalid value OR confidence below threshold.
+- Use debug: `python -m services.lite_pipeline.main extract:debug --url file://tests/fixtures/college_sample.html`.

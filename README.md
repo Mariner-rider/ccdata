@@ -101,3 +101,10 @@ ALLOW_LARGE_IMAGES=true make docker-size-report
 Use offline profile with SQLite and in-memory queue.
 Run `make init-db`, `make crawl-fixture`, and `make validate-no-docker`.
 WebClaw is optional and disabled by default in this profile.
+
+## Phase 5: Controlled real-site crawling
+Use source registry CLI:
+- `python -m services.lite_pipeline.main source:add --entity-type college --entity-name "IIM Bangalore" --url https://www.iimb.ac.in`
+- `python -m services.lite_pipeline.main source:list`
+- `python -m services.lite_pipeline.main source:crawl-active`
+Safe limits via env: CRAWL_MAX_PAGES_PER_SOURCE, CRAWL_MAX_DEPTH, CRAWL_RATE_LIMIT_SECONDS, CRAWL_TIMEOUT_SECONDS, CRAWL_SAME_DOMAIN_ONLY.
