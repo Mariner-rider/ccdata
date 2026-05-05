@@ -1,0 +1,9 @@
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+RUN useradd -m appuser
+COPY services/requirements-worker.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY services /app/services
+USER appuser
+CMD ["python", "-m", "services.lite_pipeline.main", "crawl:missing-fields"]
