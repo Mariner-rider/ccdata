@@ -1,0 +1,245 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: crawler
+      POSTGRES_PASSWORD: crawler
+      POSTGRES_DB: crawler
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crawler -d crawler"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on: [zookeeper]
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.2
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+
+  minio:
+    image: minio/minio:RELEASE.2025-01-20T14-49-07Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    volumes:
+      - minio:/data
+
+  createbucket:
+    image: minio/mc:RELEASE.2025-01-17T23-25-50Z
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "
+      until /usr/bin/mc alias set local http://minio:9000 minio minio123; do sleep 1; done;
+      /usr/bin/mc mb -p local/raw-html;
+      /usr/bin/mc anonymous set private local/raw-html;
+      exit 0;
+      "
+
+  airflow-init:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    entrypoint: /bin/bash
+    command: -c "airflow db migrate && airflow users create --username admin --password admin --firstname Air --lastname Flow --role Admin --email admin@ccdata.local"
+    environment: &airflow_env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://crawler:crawler@postgres:5432/crawler
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+      POSTGRES_DSN: postgresql://crawler:crawler@postgres:5432/crawler
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      CRAWL_QUEUE_TOPIC: crawl.queue
+      REALTIME_CRAWL_REQUEST_TOPIC: crawl.requests.realtime
+      REVIEW_EVENTS_TOPIC: reviews.events
+      SERVICE_API_KEY: ${SERVICE_API_KEY:-change-me}
+      API_RATE_LIMIT_PER_MINUTE: 120
+      ALERT_SMTP_HOST: ${ALERT_SMTP_HOST:-}
+      ALERT_SMTP_PORT: ${ALERT_SMTP_PORT:-25}
+      ALERT_TO_EMAIL: ${ALERT_TO_EMAIL:-}
+      ALERT_FROM_EMAIL: ${ALERT_FROM_EMAIL:-airflow@ccdata.local}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    depends_on: [postgres, kafka]
+
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    command: airflow scheduler
+    environment:
+      <<: *airflow_env
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    depends_on: [airflow-init]
+
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    command: airflow webserver
+    environment:
+      <<: *airflow_env
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    depends_on: [airflow-init, airflow-scheduler]
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  seed-loader:
+    build:
+      context: .
+      dockerfile: services/Dockerfile
+    command: python -m services.seed_loader.main
+    depends_on: [postgres, kafka]
+    environment: &crawler_env
+      POSTGRES_DSN: postgresql://crawler:crawler@postgres:5432/crawler
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      CRAWL_QUEUE_TOPIC: crawl.queue
+      CRAWL_RESULTS_TOPIC: crawl.results
+      PARSE_RESULTS_TOPIC: parse.results
+      SCHEMA_MAPPED_TOPIC: schema.mapped
+      ENRICHED_RESULTS_TOPIC: content.enriched
+      COLLEGE_PAGE_EVENTS_TOPIC: college.pages.events
+      CHATBOT_POSTGRES_DSN: postgresql://crawler:crawler@postgres:5432/crawler
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      REALTIME_CRAWL_REQUEST_TOPIC: crawl.requests.realtime
+      REVIEW_EVENTS_TOPIC: reviews.events
+      SERVICE_API_KEY: ${SERVICE_API_KEY:-change-me}
+      API_RATE_LIMIT_PER_MINUTE: 120
+      FRESHNESS_DAYS_THRESHOLD: 30
+      FRESHNESS_SCAN_INTERVAL_SECONDS: 300
+      FRESHNESS_MAX_EVENTS_PER_CYCLE: 200
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET: raw-html
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: minio123
+      SEED_DISPATCH_INTERVAL_SECONDS: 30
+
+  scrapy-crawler:
+    build:
+      context: .
+      dockerfile: services/Dockerfile
+    command: python -m services.crawler.main
+    depends_on: [postgres, kafka, minio, createbucket]
+    environment:
+      <<: *crawler_env
+      PER_DOMAIN_DELAY_SECONDS: 1.0
+      CRAWLER_USER_AGENT: ccdata-distributed-crawler/1.0
+
+  parser-engine:
+    build:
+      context: .
+      dockerfile: services/Dockerfile.playwright
+    command: python -m services.parser_engine.main
+    depends_on: [postgres, kafka, minio, createbucket, scrapy-crawler]
+    environment:
+      <<: *crawler_env
+
+  schema-mapper:
+    build:
+      context: .
+      dockerfile: services/Dockerfile
+    command: python -m services.schema_mapper.main
+    depends_on: [postgres, kafka, parser-engine]
+    environment:
+      <<: *crawler_env
+
+  ai-enrichment:
+    build:
+      context: .
+      dockerfile: services/Dockerfile
+    command: python -m services.ai_enrichment.main
+    depends_on: [postgres, kafka, schema-mapper]
+    environment:
+      <<: *crawler_env
+      TRANSFORMERS_CACHE: /tmp/hf-cache
+
+  college-page-service:
+    build:
+      context: .
+      dockerfile: services/Dockerfile
+    command: python -m services.college_page_service.main
+    depends_on: [postgres, kafka, ai-enrichment]
+    environment:
+      <<: *crawler_env
+
+  review-ingestion:
+    build:
+      context: .
+      dockerfile: services/Dockerfile
+    command: uvicorn services.review_ingestion.main:app --host 0.0.0.0 --port 8020 --workers 1
+    depends_on: [postgres, kafka, minio]
+    environment:
+      <<: *crawler_env
+    ports:
+      - "127.0.0.1:8020:8020"
+
+  search-engine:
+    build:
+      context: .
+      dockerfile: services/Dockerfile
+    command: uvicorn services.search_engine.main:app --host 0.0.0.0 --port 8010 --workers 1
+    depends_on: [kafka, elasticsearch, college-page-service]
+    environment:
+      <<: *crawler_env
+    ports:
+      - "127.0.0.1:8010:8010"
+
+  freshness-monitor:
+    build:
+      context: .
+      dockerfile: services/Dockerfile
+    command: python -m services.freshness_monitor.main
+    depends_on: [postgres, kafka, ai-enrichment]
+    environment:
+      <<: *crawler_env
+
+  nutch:
+    image: apache/nutch:1.20
+    volumes:
+      - ./nutch/conf/nutch-site.xml:/opt/nutch/conf/nutch-site.xml:ro
+      - ./nutch/seed:/seed:ro
+    command: sleep infinity
+
+  nutch-bridge:
+    build:
+      context: .
+      dockerfile: services/Dockerfile
+    command: python -m services.nutch_bridge.main
+    depends_on: [nutch, kafka]
+    environment:
+      <<: *crawler_env
+      NUTCH_DISCOVERY_INTERVAL_SECONDS: 900
+
+volumes:
+  pgdata:
+  minio:
+  esdata:
