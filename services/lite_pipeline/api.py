@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 import os
-from services.lite_pipeline.main import Repo,_cfg,discover,crawl_source,export_entity,review_list,review_decide,publish_entity,chatbot_sync,record_approve,enqueue_job,job_get,metrics_summary,sources_freshness,jobs_failures,quality_report_summary
+from services.lite_pipeline.main import Repo,_cfg,discover,crawl_source,export_entity,review_list,review_decide,publish_entity,chatbot_sync,record_approve,enqueue_job,job_get,metrics_summary,sources_freshness,jobs_failures,quality_report_summary,_search,public_entities_list,public_entity_get
 
 app=FastAPI(title='collegecue-local-lite')
 ADMIN_API_KEY=os.getenv('ADMIN_API_KEY','')
@@ -72,3 +72,17 @@ def failures(): return jobs_failures()
 
 @app.get('/quality/report')
 def quality(): return quality_report_summary()
+
+@app.get('/search')
+def search(q:str, entity_type:str|None=None, location:str|None=None):
+    return {"results":_search(q,entity_type,location)}
+
+@app.get('/public/entities')
+def public_entities():
+    return {"results":public_entities_list()}
+
+@app.get('/public/entities/{slug}')
+def public_entity(slug:str):
+    out=public_entity_get(slug)
+    if not out: raise HTTPException(status_code=404,detail='not found')
+    return out

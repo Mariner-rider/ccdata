@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, hashlib, json, os, sqlite3
+import argparse, hashlib, json, os, random, sqlite3, time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
@@ -97,12 +97,13 @@ class Repo:
     def init(self):
         with sqlite3.connect(self.path) as c:
             c.execute("CREATE TABLE IF NOT EXISTS source_registry(id INTEGER PRIMARY KEY,entity_type TEXT,entity_name TEXT,official_url TEXT,trust_tier TEXT,is_active INTEGER DEFAULT 1,last_crawled_at TEXT,crawl_frequency_days INTEGER DEFAULT 7,updated_at TEXT)")
-            c.execute("CREATE TABLE IF NOT EXISTS crawler_records(id INTEGER PRIMARY KEY,source_id INTEGER,entity_type TEXT,title TEXT,source_url TEXT UNIQUE,official_url TEXT,payload TEXT,missing_fields TEXT,confidence_score REAL,trust_tier TEXT,content_hash TEXT,last_crawled_at TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS crawler_records(id INTEGER PRIMARY KEY,source_id INTEGER,canonical_entity_id TEXT,entity_type TEXT,title TEXT,source_url TEXT UNIQUE,official_url TEXT,payload TEXT,missing_fields TEXT,confidence_score REAL,trust_tier TEXT,content_hash TEXT,last_crawled_at TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS quarantine_records(id INTEGER PRIMARY KEY,source_url TEXT,payload TEXT,reason TEXT,created_at TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS crawl_logs(id INTEGER PRIMARY KEY,source_url TEXT,status TEXT,detail TEXT,event_ts TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS review_queue(id INTEGER PRIMARY KEY,entity_record_id INTEGER,entity_type TEXT,title TEXT,confidence_score REAL,missing_fields TEXT,quality_gate_status TEXT,suggested_action TEXT,created_at TEXT,reviewed_at TEXT,reviewed_by TEXT,decision TEXT,notes TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS published_records(id INTEGER PRIMARY KEY,entity_record_id INTEGER,version INTEGER,payload TEXT,published_at TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS chatbot_sync_logs(id INTEGER PRIMARY KEY,entity_record_id INTEGER,title TEXT,published_version INTEGER,fields_synced TEXT,status TEXT,created_at TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS public_entities(id INTEGER PRIMARY KEY,entity_record_id INTEGER UNIQUE,source_id INTEGER,entity_type TEXT,title TEXT,slug TEXT UNIQUE,location TEXT,country TEXT,summary TEXT,page_json TEXT,search_text TEXT,confidence_score REAL,lifecycle_state TEXT,published_version INTEGER,canonical_entity_id TEXT,created_at TEXT,updated_at TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY,entity_record_id INTEGER,action TEXT,notes TEXT,reviewed_by TEXT,created_at TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS crawl_jobs(id INTEGER PRIMARY KEY,source_id INTEGER,job_type TEXT,status TEXT,dry_run INTEGER,priority INTEGER,payload_json TEXT,result_json TEXT,error_message TEXT,idempotency_key TEXT,created_at TEXT,started_at TEXT,completed_at TEXT,retry_count INTEGER DEFAULT 0,next_retry_at TEXT,last_error TEXT)")
 
@@ -110,7 +111,10 @@ class Repo:
             except Exception: pass
             try: c.execute('ALTER TABLE chatbot_sync_logs ADD COLUMN idempotency_key TEXT')
             except Exception: pass
-            for q in ["ALTER TABLE source_registry ADD COLUMN last_crawled_at TEXT","ALTER TABLE source_registry ADD COLUMN crawl_frequency_days INTEGER DEFAULT 7","ALTER TABLE source_registry ADD COLUMN updated_at TEXT","ALTER TABLE crawl_jobs ADD COLUMN retry_count INTEGER DEFAULT 0","ALTER TABLE crawl_jobs ADD COLUMN next_retry_at TEXT","ALTER TABLE crawl_jobs ADD COLUMN last_error TEXT","ALTER TABLE crawler_records ADD COLUMN source_id INTEGER","ALTER TABLE published_records ADD COLUMN source_id INTEGER","ALTER TABLE chatbot_sync_logs ADD COLUMN source_id INTEGER"]:
+            for q in ["ALTER TABLE source_registry ADD COLUMN last_crawled_at TEXT","ALTER TABLE source_registry ADD COLUMN crawl_frequency_days INTEGER DEFAULT 7","ALTER TABLE source_registry ADD COLUMN updated_at TEXT","ALTER TABLE crawl_jobs ADD COLUMN retry_count INTEGER DEFAULT 0","ALTER TABLE crawl_jobs ADD COLUMN next_retry_at TEXT","ALTER TABLE crawl_jobs ADD COLUMN last_error TEXT","ALTER TABLE crawler_records ADD COLUMN source_id INTEGER","ALTER TABLE crawler_records ADD COLUMN canonical_entity_id TEXT","ALTER TABLE published_records ADD COLUMN source_id INTEGER","ALTER TABLE chatbot_sync_logs ADD COLUMN source_id INTEGER"]:
+                try: c.execute(q)
+                except Exception: pass
+            for q in ["ALTER TABLE public_entities ADD COLUMN canonical_entity_id TEXT","ALTER TABLE public_entities ADD COLUMN country TEXT","ALTER TABLE public_entities ADD COLUMN summary TEXT","ALTER TABLE public_entities ADD COLUMN lifecycle_state TEXT","ALTER TABLE public_entities ADD COLUMN published_version INTEGER","ALTER TABLE public_entities ADD COLUMN search_text TEXT","ALTER TABLE public_entities ADD COLUMN updated_at TEXT"]:
                 try: c.execute(q)
                 except Exception: pass
             c.commit()
@@ -124,13 +128,19 @@ class Repo:
         with sqlite3.connect(self.path) as c: return c.execute("SELECT id,entity_type,entity_name,official_url,trust_tier,is_active FROM source_registry").fetchall()
     def save_entity(self, rec):
         with sqlite3.connect(self.path) as c:
-            row=c.execute("SELECT id,content_hash FROM crawler_records WHERE source_url=?",(rec['source_url'],)).fetchone()
+            row=c.execute("SELECT id,content_hash,payload FROM crawler_records WHERE source_url=?",(rec['source_url'],)).fetchone()
             if row and row[1]==rec['content_hash']: return 'unchanged'
             if row:
+                prev=json.loads(row[2] or '{}')
+                changes=[]
+                for k,v in rec.get('fields',{}).items():
+                    ov=prev.get('fields',{}).get(k)
+                    if ov!=v: changes.append({"field_name":k,"old_value":ov,"new_value":v,"timestamp":datetime.now(timezone.utc).isoformat()})
+                rec['change_log']=changes
                 c.execute("UPDATE crawler_records SET payload=?,missing_fields=?,confidence_score=?,content_hash=?,last_crawled_at=? WHERE id=?",(json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['content_hash'],rec['last_crawled_at'],row[0])); c.commit(); return 'updated'
             state='draft' if (not rec['missing_fields'] and rec['confidence_score']>=0.85) else 'needs_review'
             rec['lifecycle_state']=state
-            c.execute("INSERT INTO crawler_records(source_id,entity_type,title,source_url,official_url,payload,missing_fields,confidence_score,trust_tier,content_hash,last_crawled_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(rec.get('source_id'),rec['entity_type'],rec['title'],rec['source_url'],rec['official_url'],json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['trust_tier'],rec['content_hash'],rec['last_crawled_at']))
+            c.execute("INSERT INTO crawler_records(source_id,canonical_entity_id,entity_type,title,source_url,official_url,payload,missing_fields,confidence_score,trust_tier,content_hash,last_crawled_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(rec.get('source_id'),rec.get('canonical_entity_id'),rec['entity_type'],rec['title'],rec['source_url'],rec['official_url'],json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['trust_tier'],rec['content_hash'],rec['last_crawled_at']))
             rid=c.execute('select last_insert_rowid()').fetchone()[0]
             if state=='needs_review':
                 c.execute("INSERT INTO review_queue(entity_record_id,entity_type,title,confidence_score,missing_fields,quality_gate_status,suggested_action,created_at) VALUES(?,?,?,?,?,?,?,?)",(rid,rec['entity_type'],rec['title'],rec['confidence_score'],json.dumps(rec['missing_fields']),'fail','review',datetime.now(timezone.utc).isoformat()))
@@ -193,14 +203,89 @@ def merge_pages(entity_type,name,official_url,pages,trust):
 def quality_report(plan,pages,rec,gate,reason=''):
     return {"pages_discovered":len(plan),"pages_crawled":len(pages),"page_types_detected":sorted({p['page_type'] for p in pages}),"required_fields_found":[f for f in REQ_COLLEGE if f not in rec['missing_fields']],"missing_fields":rec['missing_fields'],"confidence_score":rec['confidence_score'],"quality_gate":gate,"quarantine_reason":reason,"top_field_sources":rec['metadata']['field_sources']}
 
+def _parse_env_list(name):
+    return [x.strip() for x in os.getenv(name,'').split(',') if x.strip()]
+
+def _fetch_extract_resilient(url, timeout=15):
+    max_retries=int(os.getenv('CRAWL_MAX_RETRIES','2')); base=float(os.getenv('CRAWL_BACKOFF_BASE_SECONDS','0.05'))
+    uas=_parse_env_list('CRAWL_USER_AGENTS') or ['ccdata-lite-bot/1.0']; proxies=_parse_env_list('HTTP_PROXY_LIST')
+    for i in range(max_retries+1):
+        _ua=uas[i % len(uas)]; _px=proxies[i % len(proxies)] if proxies else None
+        try:
+            sim=os.getenv('CRAWL_SIMULATE_STATUS','')
+            if sim:
+                parts=[int(x) for x in sim.split(',') if x.strip()]; code=parts[min(i,len(parts)-1)]
+                if code==403: raise RuntimeError('blocked:403')
+                if code==429: raise RuntimeError('cooldown:429')
+                if code>=500: raise RuntimeError(f'server_error:{code}')
+            if _px and os.getenv('CRAWL_SIMULATE_PROXY_FAIL','false').lower()=='true': raise RuntimeError('proxy_failed')
+            return extract_fallback(url, timeout=timeout)
+        except Exception as e:
+            msg=str(e)
+            if 'blocked:403' in msg or 'cooldown:429' in msg: raise
+            if i<max_retries:
+                time.sleep(base*(2**i)+random.uniform(0,base)); continue
+            raise
+
+def _canonical_sig(rec):
+    nm=(rec.get('fields',{}).get('name') or rec.get('title') or '').strip().lower()
+    loc=(rec.get('fields',{}).get('location') or '').strip().lower()
+    dom=urlparse(rec.get('official_url') or rec.get('source_url') or '').netloc.lower()
+    return hashlib.sha1(f'{nm}|{loc}|{dom}'.encode()).hexdigest()
+
+def _search(query, entity_type=None, location=None):
+    q=(query or '').lower(); out=[]
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c: rows=c.execute('select id,entity_type,title,location,country,summary,search_text from public_entities where lifecycle_state=\"published\"').fetchall()
+    for rid,et,title,loc,country,summary,search_text in rows:
+        text=' '.join([str(title or ''),str(loc or ''),str(country or ''),str(summary or ''),str(search_text or '')]).lower()
+        if q and q not in text: continue
+        if entity_type and et!=entity_type: continue
+        if location and location.lower() not in str(loc or '').lower(): continue
+        out.append({'id':rid,'entity_type':et,'title':title,'location':loc or '','country':country or '','summary':summary or '','score':text.count(q) if q else 1})
+    return sorted(out,key=lambda x:(x['score'],x['id']),reverse=True)
+
+def _slugify(title, location):
+    raw=f"{title or ''}-{location or ''}".strip().lower()
+    out=''.join(ch if ch.isalnum() else '-' for ch in raw)
+    out='-'.join([x for x in out.split('-') if x]) or 'entity'
+    return out
+
+def _upsert_public_entity(c, entity_record_id, source_id, entity_type, rec, version):
+    fields=rec.get('fields',{})
+    title=rec.get('title') or fields.get('name') or 'untitled'
+    location=fields.get('location','')
+    country=fields.get('country','')
+    summary=f"{title} in {location}".strip()
+    search_text=' '.join([title,location,country,' '.join(fields.get('courses',[]) if isinstance(fields.get('courses'),list) else []),summary]).strip()
+    page_json=json.dumps({'title':title,'location':location,'country':country,'courses':fields.get('courses',[]),'summary':summary})
+    slug=_slugify(title,location)
+    row=c.execute('select id,slug from public_entities where entity_record_id=?',(entity_record_id,)).fetchone()
+    if row: slug=row[1]
+    else:
+        i=2; base=slug
+        while c.execute('select 1 from public_entities where slug=?',(slug,)).fetchone():
+            slug=f"{base}-{i}"; i+=1
+    now=datetime.now(timezone.utc).isoformat()
+    if row:
+        c.execute('update public_entities set source_id=?,entity_type=?,title=?,slug=?,location=?,country=?,summary=?,page_json=?,search_text=?,confidence_score=?,lifecycle_state=?,published_version=?,canonical_entity_id=?,updated_at=? where entity_record_id=?',(source_id,entity_type,title,slug,location,country,summary,page_json,search_text,rec.get('confidence_score'),rec.get('lifecycle_state'),version,rec.get('canonical_entity_id'),now,entity_record_id))
+    else:
+        c.execute('insert into public_entities(entity_record_id,source_id,entity_type,title,slug,location,country,summary,page_json,search_text,confidence_score,lifecycle_state,published_version,canonical_entity_id,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(entity_record_id,source_id,entity_type,title,slug,location,country,summary,page_json,search_text,rec.get('confidence_score'),rec.get('lifecycle_state'),version,rec.get('canonical_entity_id'),now,now))
+
 def crawl_source(id,dry=False):
     cfg=_cfg(); repo=Repo(cfg.database_url); repo.init(); sid,etype,name,url,trust=repo.get_source(id)
     plan=discover(url,cfg,repo); pages=[]
     for p in plan:
         if not p['robots_allowed']: repo.log(p['url'],'blocked','robots'); continue
-        try: pages.append({"url":p['url'],"extract":extract_fallback(p['url'], timeout=cfg.timeout),"page_type":p['page_type']})
-        except Exception as e: repo.log(p['url'],'error',str(e))
-    rec=merge_pages(etype,name,url,pages,trust); rec['source_id']=sid
+        try: pages.append({"url":p['url'],"extract":_fetch_extract_resilient(p['url'], timeout=cfg.timeout),"page_type":p['page_type']})
+        except Exception as e:
+            m=str(e)
+            if 'blocked:403' in m: repo.log(p['url'],'blocked','403')
+            elif 'cooldown:429' in m: repo.log(p['url'],'cooldown','429')
+            else: repo.log(p['url'],'error',m)
+    rec=merge_pages(etype,name,url,pages,trust); rec['source_id']=sid; rec['canonical_entity_id']=_canonical_sig(rec)
+    with sqlite3.connect(repo.path) as c:
+        dup=c.execute('select id from crawler_records where canonical_entity_id=? and source_id!=? limit 1',(rec['canonical_entity_id'],sid)).fetchone()
+    if dup: rec['duplicate_of']=dup[0]
     valid=rec['confidence_score']>=0.65 and (1-len(rec['missing_fields'])/len(REQ_COLLEGE))>=0.7 and rec['trust_tier'] in TRUST and rec['content_hash']
     qr=quality_report(plan,pages,rec,'pass' if valid else 'fail','quality_gate_failed' if not valid else '')
     if dry: return {"dry_run":True,"quality_report":qr,"record":rec}
@@ -299,13 +384,36 @@ def publish_entity(i,idempotency_key=None):
         v=(c.execute("SELECT COALESCE(MAX(version),0) FROM published_records WHERE entity_record_id=?",(i,)).fetchone()[0])+1
         rec['lifecycle_state']='published'
         c.execute("UPDATE crawler_records SET payload=? WHERE id=?",(json.dumps(rec),i))
-        c.execute("INSERT INTO published_records(entity_record_id,source_id,version,payload,published_at,idempotency_key) VALUES(?,?,?,?,?,?)",(i,src_id,v,json.dumps(rec),datetime.now(timezone.utc).isoformat(),idempotency_key)); c.commit()
+        c.execute("INSERT INTO published_records(entity_record_id,source_id,version,payload,published_at,idempotency_key) VALUES(?,?,?,?,?,?)",(i,src_id,v,json.dumps(rec),datetime.now(timezone.utc).isoformat(),idempotency_key))
+        _upsert_public_entity(c,i,src_id,rec.get('entity_type','college'),rec,v)
+        c.commit()
     _log_event('publish_completed',entity_id=i,version=v)
     return {'entity_id':i,'version':v,'status':'published'}
 
 def publish_list():
     with sqlite3.connect(Repo(_cfg().database_url).path) as c: rows=c.execute("SELECT entity_record_id,version,published_at FROM published_records ORDER BY id DESC").fetchall()
     return [dict(entity_id=r[0],version=r[1],published_at=r[2]) for r in rows]
+
+def index_rebuild():
+    repo=Repo(_cfg().database_url); repo.init(); rebuilt=0
+    with sqlite3.connect(repo.path) as c:
+        rows=c.execute('select p.entity_record_id,p.source_id,p.version,p.payload from published_records p join (select entity_record_id,max(version) mv from published_records group by entity_record_id) x on p.entity_record_id=x.entity_record_id and p.version=x.mv').fetchall()
+        for eid,sid,ver,payload in rows:
+            rec=json.loads(payload or '{}')
+            _upsert_public_entity(c,eid,sid,rec.get('entity_type','college'),rec,ver); rebuilt+=1
+        c.commit()
+    return {'ok':True,'rebuilt':rebuilt}
+
+def public_entities_list():
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c:
+        rows=c.execute("select id,entity_type,title,slug,location,country,summary,published_version from public_entities where lifecycle_state='published' order by id desc").fetchall()
+    return [{'id':r[0],'entity_type':r[1],'title':r[2],'slug':r[3],'location':r[4],'country':r[5],'summary':r[6],'published_version':r[7]} for r in rows]
+
+def public_entity_get(slug):
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c:
+        r=c.execute("select id,entity_type,title,slug,location,country,summary,page_json,published_version from public_entities where slug=? and lifecycle_state='published'",(slug,)).fetchone()
+    if not r: return None
+    return {'id':r[0],'entity_type':r[1],'title':r[2],'slug':r[3],'location':r[4],'country':r[5],'summary':r[6],'page_json':json.loads(r[7] or '{}'),'published_version':r[8]}
 
 def chatbot_sync(eid,idempotency_key=None):
     with sqlite3.connect(Repo(_cfg().database_url).path) as c:
@@ -618,7 +726,8 @@ def main():
     sub.add_parser('quality:report')
     sub.add_parser('integrity:check')
     ir=sub.add_parser('integrity:repair'); ir.add_argument('--dry-run',action='store_true'); ir.add_argument('--apply',action='store_true')
-    a=sub.add_parser('source:add'); a.add_argument('--entity-type',required=True); a.add_argument('--entity-name',required=True); a.add_argument('--url',required=True); a.add_argument('--trust-tier',default='official')
+    a=sub.add_parser('source:add'); a.add_argument('--entity-type',required=True); a.add_argument('--entity-name',required=True); a.add_argument('--url',required=True); a.add_argument('--trust-tier',default='official'); a.add_argument('--trigger-crawl',action='store_true')
+    s=sub.add_parser('search'); s.add_argument('--query',required=True); s.add_argument('--entity-type',default=None); s.add_argument('--location',default=None)
     sub.add_parser('source:list')
     p=sub.add_parser('source:preview'); p.add_argument('--id',type=int,required=True)
     c=sub.add_parser('source:crawl'); c.add_argument('--id',type=int,required=True); c.add_argument('--dry-run',action='store_true')
@@ -636,6 +745,9 @@ def main():
     rr=sub.add_parser('review:reject'); rr.add_argument('--id',type=int,required=True); rr.add_argument('--reviewed-by',required=True); rr.add_argument('--notes',default='')
     pe=sub.add_parser('publish:entity'); pe.add_argument('--id',type=int,required=True); pe.add_argument('--idempotency-key',default=None)
     sub.add_parser('publish:list')
+    sub.add_parser('index:rebuild')
+    sub.add_parser('public:list')
+    pg=sub.add_parser('public:get'); pg.add_argument('--slug',required=True)
     cs=sub.add_parser('chatbot:sync'); cs.add_argument('--entity-id',type=int,required=True); cs.add_argument('--idempotency-key',default=None)
     rl=sub.add_parser('record:list'); rl.add_argument('--state',default=None)
     rsh=sub.add_parser('record:show'); rsh.add_argument('--id',type=int,required=True)
@@ -659,7 +771,10 @@ def main():
     elif args.cmd=='quality:report': print(json.dumps(quality_report_summary(),indent=2))
     elif args.cmd=='integrity:check': print(json.dumps(integrity_check(),indent=2))
     elif args.cmd=='integrity:repair': print(json.dumps(integrity_repair(apply=args.apply and not args.dry_run),indent=2))
-    elif args.cmd=='source:add': print('added', repo.add_source(vars(args)))
+    elif args.cmd=='source:add':
+        sid=repo.add_source(vars(args)); print('added', sid)
+        if args.trigger_crawl: print(json.dumps(enqueue_job(sid,'crawl',False,5),indent=2))
+    elif args.cmd=='search': print(json.dumps(_search(args.query,args.entity_type,args.location),indent=2))
     elif args.cmd=='source:list': print(json.dumps([{"id":r[0],"entity_type":r[1],"entity_name":r[2],"official_url":r[3],"trust_tier":r[4],"is_active":r[5]} for r in repo.list_sources()],indent=2))
     elif args.cmd=='source:preview': s=repo.get_source(args.id); plan=discover(s[3],_cfg(),repo); print(json.dumps({"source_id":args.id,"estimated_page_count":len(plan),"urls":plan,"quality_report":{"pages_discovered":len(plan)}},indent=2))
     elif args.cmd=='source:crawl': print(json.dumps(crawl_source(args.id,args.dry_run),indent=2))
@@ -681,6 +796,9 @@ def main():
     elif args.cmd=='review:reject': print(json.dumps(review_decide(args.id,'rejected',args.reviewed_by,args.notes),indent=2))
     elif args.cmd=='publish:entity': print(json.dumps(publish_entity(args.id,args.idempotency_key),indent=2))
     elif args.cmd=='publish:list': print(json.dumps(publish_list(),indent=2))
+    elif args.cmd=='index:rebuild': print(json.dumps(index_rebuild(),indent=2))
+    elif args.cmd=='public:list': print(json.dumps(public_entities_list(),indent=2))
+    elif args.cmd=='public:get': print(json.dumps(public_entity_get(args.slug),indent=2))
     elif args.cmd=='chatbot:sync': print(json.dumps(chatbot_sync(args.entity_id,args.idempotency_key),indent=2))
     elif args.cmd=='record:list': print(json.dumps(record_list(args.state),indent=2))
     elif args.cmd=='record:show': print(json.dumps(record_show(args.id),indent=2))

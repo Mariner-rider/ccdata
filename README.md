@@ -160,3 +160,18 @@ Commands:
 - `jobs:failures`
 - `quality:report`
 Use `LOG_FORMAT=json` for structured operational logs.
+
+## Phase 18 Robustness & Search
+- HTTP resilience: retries/backoff/jitter with status handling (403 blocked, 429 cooldown, 5xx retry) via `CRAWL_MAX_RETRIES`, `CRAWL_BACKOFF_BASE_SECONDS`, `CRAWL_USER_AGENTS`.
+- Optional proxy rotation via `HTTP_PROXY_LIST` with graceful fallback.
+- Cross-source dedup with `canonical_entity_id` and duplicate flagging.
+- Delta tracking through `change_log` on record updates.
+- Event-driven ingest: `source:add --trigger-crawl`.
+- Search: `search --query "MBA Bangalore"` and API `GET /search?q=...` with `entity_type`/`location` filters.
+
+## Phase 19 Public Data Model
+- `public_entities` separates production page/search data from raw crawler records.
+- Publish flow now upserts page-ready `page_json` + `search_text` and keeps `published_records` history.
+- Slugs are stable (`title-location`) with uniqueness suffixes (`-2`, `-3`).
+- Reindex command: `python -m services.lite_pipeline.main index:rebuild`.
+- Public endpoints: `GET /public/entities`, `GET /public/entities/{slug}`, search via `GET /search?q=...` over published entities only.

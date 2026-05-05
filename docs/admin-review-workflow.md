@@ -35,3 +35,8 @@ Auto-publishing remains disabled by design.
 
 ## Monitoring review/publish ops
 Use metrics and quality reports to track draft/review/published counts and missing-field trends.
+
+## Public model separation
+- Review/approval still acts on crawler records.
+- Only published records are materialized into `public_entities` for public pages and search.
+- This prevents raw extraction payloads from leaking to public APIs.

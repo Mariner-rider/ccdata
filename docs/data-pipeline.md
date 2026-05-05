@@ -48,3 +48,13 @@ Scheduler enforces due-date + budgets + cooldown and worker retries failed jobs 
 
 ## Phase 16 observability
 Read-only API endpoints: `/metrics/summary`, `/sources/freshness`, `/jobs/failures`, `/quality/report`.
+
+## Phase 18 Enhancements
+- Added resilient fetch behavior (retry, jitter, UA/proxy rotation, status-aware handling).
+- Added dedup signature + duplicate marking and delta change tracking.
+- Added lightweight retrieval search over title/courses/location with CLI/API access.
+
+## Phase 19 Public Entity Index
+- Public/search-serving data now lives in `public_entities`, not `crawler_records`.
+- `publish:entity` writes/updates `public_entities` while preserving publish history in `published_records`.
+- `index:rebuild` safely rebuilds public index from latest published versions.
