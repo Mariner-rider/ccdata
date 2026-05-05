@@ -130,7 +130,7 @@ class Repo:
                 c.execute("UPDATE crawler_records SET payload=?,missing_fields=?,confidence_score=?,content_hash=?,last_crawled_at=? WHERE id=?",(json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['content_hash'],rec['last_crawled_at'],row[0])); c.commit(); return 'updated'
             state='draft' if (not rec['missing_fields'] and rec['confidence_score']>=0.85) else 'needs_review'
             rec['lifecycle_state']=state
-            c.execute("INSERT INTO crawler_records(source_id,entity_type,title,source_url,official_url,payload,missing_fields,confidence_score,trust_tier,content_hash,last_crawled_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(rec.get('source_id'),rec['entity_type'],rec['title'],rec['source_url'],rec['official_url'],json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['trust_tier'],rec['content_hash'],rec['last_crawled_at']))
+            c.execute("INSERT INTO crawler_records(source_id,entity_type,title,source_url,official_url,payload,missing_fields,confidence_score,trust_tier,content_hash,last_crawled_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(rec.get('source_id'),rec['entity_type'],rec['title'],rec['source_url'],rec['official_url'],json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['trust_tier'],rec['content_hash'],rec['last_crawled_at']))
             rid=c.execute('select last_insert_rowid()').fetchone()[0]
             if state=='needs_review':
                 c.execute("INSERT INTO review_queue(entity_record_id,entity_type,title,confidence_score,missing_fields,quality_gate_status,suggested_action,created_at) VALUES(?,?,?,?,?,?,?,?)",(rid,rec['entity_type'],rec['title'],rec['confidence_score'],json.dumps(rec['missing_fields']),'fail','review',datetime.now(timezone.utc).isoformat()))
@@ -343,7 +343,7 @@ def review_seed(entity_id):
     with sqlite3.connect(repo.path) as c:
         pr=c.execute('SELECT payload,entity_type,title,confidence_score,missing_fields FROM crawler_records WHERE id=?',(entity_id,)).fetchone()
         if not pr: raise RuntimeError('record not found')
-        rec=json.loads(pr[0]); src_id=pr[1]; st=rec.get('lifecycle_state')
+        rec=json.loads(pr[0]); st=rec.get('lifecycle_state')
         if st not in {'draft','needs_review','approved'}: raise RuntimeError('seed only for draft/needs_review')
         ex=c.execute('SELECT id FROM review_queue WHERE entity_record_id=?',(entity_id,)).fetchone()
         if not ex:
