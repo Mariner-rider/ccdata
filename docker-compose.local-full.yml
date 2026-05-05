@@ -1,0 +1,48 @@
+version: '3.9'
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: crawler
+      POSTGRES_PASSWORD: crawler
+      POSTGRES_DB: crawler
+    volumes:
+      - pgdata_full:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  redis:
+    image: redis:7-alpine
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.11
+    environment:
+      MEILI_NO_ANALYTICS: "true"
+
+  core-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.core
+    environment:
+      POSTGRES_DSN: postgresql://crawler:crawler@postgres:5432/crawler
+      REDIS_URL: redis://redis:6379/0
+      WEBCLAW_ENABLED: "true"
+      WEBCLAW_BASE_URL: ${WEBCLAW_BASE_URL:-}
+      DEBUG_RAW_HTML: ${DEBUG_RAW_HTML:-false}
+      RAW_HTML_RETENTION_DAYS: ${RAW_HTML_RETENTION_DAYS:-7}
+    depends_on: [postgres, redis]
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    depends_on: [postgres, redis]
+
+  browser-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.browser-worker
+    profiles: ["browser"]
+    depends_on: [postgres, redis]
+
+volumes:
+  pgdata_full:

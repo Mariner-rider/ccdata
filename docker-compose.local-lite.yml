@@ -1,0 +1,73 @@
+version: '3.9'
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: crawler
+      POSTGRES_PASSWORD: crawler
+      POSTGRES_DB: crawler
+    volumes:
+      - pgdata_lite:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crawler -d crawler"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 1g
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 256m
+
+  core-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.core
+    command: uvicorn services.lite_pipeline.api:app --host 0.0.0.0 --port 8000
+    environment:
+      POSTGRES_DSN: postgresql://crawler:crawler@postgres:5432/crawler
+      REDIS_URL: redis://redis:6379/0
+      WEBCLAW_ENABLED: "true"
+      WEBCLAW_BASE_URL: ${WEBCLAW_BASE_URL:-}
+      DEBUG_RAW_HTML: "false"
+      RAW_HTML_RETENTION_DAYS: 7
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "127.0.0.1:8000:8000"
+    mem_limit: 1g
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    command: python -m services.lite_pipeline.main crawl:missing-fields
+    environment:
+      POSTGRES_DSN: postgresql://crawler:crawler@postgres:5432/crawler
+      REDIS_URL: redis://redis:6379/0
+      WEBCLAW_ENABLED: "true"
+      WEBCLAW_BASE_URL: ${WEBCLAW_BASE_URL:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    mem_limit: 1g
+
+volumes:
+  pgdata_lite:
