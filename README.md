@@ -108,3 +108,10 @@ Use source registry CLI:
 - `python -m services.lite_pipeline.main source:list`
 - `python -m services.lite_pipeline.main source:crawl-active`
 Safe limits via env: CRAWL_MAX_PAGES_PER_SOURCE, CRAWL_MAX_DEPTH, CRAWL_RATE_LIMIT_SECONDS, CRAWL_TIMEOUT_SECONDS, CRAWL_SAME_DOMAIN_ONLY.
+
+## Phase 7 robustness
+- Use `source:preview --id <id>` to inspect prioritized crawl URLs, page type, robots decision, and estimated page count.
+- Use `source:crawl --id <id> --dry-run` to fetch/merge without DB writes.
+- Multi-page crawl merges into one entity profile and removes heading-only pollution in list fields.
+- Quality gate routes low-quality records to `quarantine_records`.
+- Export page-ready JSON with `export:entity --id <id> --format json`.

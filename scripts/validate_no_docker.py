@@ -18,8 +18,10 @@ code, out = run([sys.executable, "-m", "services.lite_pipeline.main", "init-db"]
 report.append(f"init-db: {code}")
 code, out = run([sys.executable, "-m", "services.lite_pipeline.main", "extract:test", "--url", "file://tests/fixtures/college_sample.html"])
 report.append(f"extract:test: {code}")
-code, out = run([sys.executable, "-m", "services.lite_pipeline.main", "crawl:single", "--url", "file://tests/fixtures/college_sample.html"])
-report.append(f"crawl:single: {code}")
+code, out = run([sys.executable, "-m", "services.lite_pipeline.main", "source:add", "--entity-type", "college", "--entity-name", "Fixture", "--url", "file://tests/fixtures/college_sample.html"])
+report.append(f"source:add: {code}")
+code, out = run([sys.executable, "-m", "services.lite_pipeline.main", "source:crawl", "--id", "1"])
+report.append(f"source:crawl: {code}")
 
 con = sqlite3.connect("collegecue_local.db")
 exists = con.execute("SELECT count(*) FROM crawler_records").fetchone()[0]

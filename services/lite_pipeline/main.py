@@ -1,176 +1,154 @@
 from __future__ import annotations
-import argparse, hashlib, json, os, sqlite3, time
+import argparse, hashlib, json, os, sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from urllib import robotparser
-from html.parser import HTMLParser
-
 from services.extraction.webclaw_adapter.fallback_extractor import extract_fallback
 
-RAW_RETENTION_DAYS = int(os.getenv("RAW_HTML_RETENTION_DAYS", "7"))
-ARTIFACT_DIR = os.getenv("ARTIFACT_DIR", "./artifacts")
-TRUST = {"official":1.0,"government/regulator":0.95,"recognized news":0.75,"aggregator":0.60,"user/review":0.40}
-REQUIRED = {
-"college":["name","location","official_website","courses","fees","admission_link","placement","faculty","hostel"],
-"admission":["institution_name","program","application_start_date","application_deadline","apply_link","eligibility"],
-"job":["title","organization","location","deadline","apply_link","eligibility"],
-"scholarship":["scholarship_name","provider","eligibility","amount","deadline","apply_link"],
-"institute":["name","location","courses","fees","contact","reviews"],
-"news":["title","published_date","source","category","summary","url"],
-"education_loan":["bank_name","loan_type","interest_rate","eligibility","max_amount","apply_link"],
-}
-KEYWORDS=["admission","courses","fees","placement","faculty","hostel","scholarship","career","jobs","news"]
+TRUST={"official":1.0,"government/regulator":0.95,"recognized news":0.75,"aggregator":0.60,"user/review":0.40}
+REQ_COLLEGE=["name","location","official_website","courses","fees","admission_link","placement","faculty","hostel"]
+KEYWORDS=["admission","courses","fees","placement","faculty","hostel","infrastructure","scholarship","contact","about"]
 
 class LinkParser(HTMLParser):
-    def __init__(self):
-        super().__init__(); self.links=[]
+    def __init__(self): super().__init__(); self.links=[]
     def handle_starttag(self, tag, attrs):
         if tag=="a":
             h=dict(attrs).get("href")
             if h: self.links.append(h)
 
 @dataclass
-class RuntimeConfig:
-    database_url:str; max_pages:int; max_depth:int; rate:float; timeout:float; same_domain:bool
+class Cfg: database_url:str; max_pages:int; timeout:float; same_domain:bool
 
-class Repo:
-    def __init__(self, db_url:str): self.path=db_url.replace("sqlite:///","")
-    def init_db(self):
-        with sqlite3.connect(self.path) as c:
-            c.execute("""CREATE TABLE IF NOT EXISTS crawler_records(id INTEGER PRIMARY KEY, entity_type TEXT, title TEXT, source_url TEXT, official_url TEXT, summary TEXT, extracted_fields TEXT, missing_fields TEXT, confidence_score REAL, trust_tier TEXT, freshness_status TEXT, content_hash TEXT UNIQUE, last_crawled_at TEXT, updated_at TEXT)""")
-            c.execute("""CREATE TABLE IF NOT EXISTS source_registry(id INTEGER PRIMARY KEY, entity_type TEXT, entity_name TEXT, official_url TEXT, country TEXT, trust_tier TEXT, crawl_frequency_days INTEGER, last_crawled_at TEXT, is_active INTEGER, created_at TEXT, updated_at TEXT)""")
-            c.execute("""CREATE TABLE IF NOT EXISTS crawl_logs(id INTEGER PRIMARY KEY, source_id INTEGER, url TEXT, status TEXT, detail TEXT, event_ts TEXT)""")
-            c.execute("""CREATE TABLE IF NOT EXISTS crawl_tasks(id INTEGER PRIMARY KEY, source_id INTEGER, url TEXT, reason TEXT, created_at TEXT)""")
-            c.execute("""CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY, record_id INTEGER, old_content_hash TEXT, new_content_hash TEXT, changed_at TEXT, old_payload TEXT)""")
-            c.commit()
-    def add_source(self,e):
-        now=datetime.now(timezone.utc).isoformat()
-        with sqlite3.connect(self.path) as c:
-            c.execute("INSERT INTO source_registry(entity_type,entity_name,official_url,country,trust_tier,crawl_frequency_days,last_crawled_at,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?,NULL,1,?,?)",(e['entity_type'],e['entity_name'],e.get('official_url') or e.get('url'),e.get('country',''),e.get('trust_tier','official'),e.get('crawl_frequency_days',7),now,now)); c.commit()
-    def list_sources(self):
-        with sqlite3.connect(self.path) as c: return c.execute("SELECT id,entity_type,entity_name,official_url,trust_tier,is_active FROM source_registry ORDER BY id").fetchall()
-    def get_source(self,id):
-        with sqlite3.connect(self.path) as c: return c.execute("SELECT id,entity_type,entity_name,official_url,country,trust_tier,crawl_frequency_days,is_active FROM source_registry WHERE id=?",(id,)).fetchone()
-    def active_sources(self):
-        with sqlite3.connect(self.path) as c: return c.execute("SELECT id FROM source_registry WHERE is_active=1").fetchall()
-    def upsert_record(self, rec):
-        with sqlite3.connect(self.path) as c:
-            row=c.execute("SELECT id,content_hash,extracted_fields FROM crawler_records WHERE source_url=? AND entity_type=?",(rec['source_url'],rec['entity_type'])).fetchone()
-            now=datetime.now(timezone.utc).isoformat()
-            if row:
-                if row[1]==rec['content_hash']: return "unchanged"
-                c.execute("INSERT INTO audit_log(record_id,old_content_hash,new_content_hash,changed_at,old_payload) VALUES(?,?,?,?,?)",(row[0],row[1],rec['content_hash'],now,row[2]))
-                c.execute("UPDATE crawler_records SET title=?,official_url=?,summary=?,extracted_fields=?,missing_fields=?,confidence_score=?,trust_tier=?,freshness_status=?,content_hash=?,last_crawled_at=?,updated_at=? WHERE id=?",(rec['title'],rec['official_url'],rec['summary'],json.dumps(rec['extracted_fields']),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['trust_tier'],rec['freshness_status'],rec['content_hash'],rec['last_crawled_at'],now,row[0]))
-                c.commit(); return "updated"
-            c.execute("INSERT INTO crawler_records(entity_type,title,source_url,official_url,summary,extracted_fields,missing_fields,confidence_score,trust_tier,freshness_status,content_hash,last_crawled_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(rec['entity_type'],rec['title'],rec['source_url'],rec['official_url'],rec['summary'],json.dumps(rec['extracted_fields']),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['trust_tier'],rec['freshness_status'],rec['content_hash'],rec['last_crawled_at'],now)); c.commit(); return "created"
-    def add_task(self,source_id,url,reason):
-        with sqlite3.connect(self.path) as c: c.execute("INSERT INTO crawl_tasks(source_id,url,reason,created_at) VALUES(?,?,?,?)",(source_id,url,reason,datetime.now(timezone.utc).isoformat())); c.commit()
-    def log(self,source_id,url,status,detail):
-        with sqlite3.connect(self.path) as c: c.execute("INSERT INTO crawl_logs(source_id,url,status,detail,event_ts) VALUES(?,?,?,?,?)",(source_id,url,status,detail[:2000],datetime.now(timezone.utc).isoformat())); c.commit()
+def _cfg(): return Cfg(os.getenv("DATABASE_URL","sqlite:///./collegecue_local.db"),int(os.getenv("CRAWL_MAX_PAGES_PER_SOURCE","25")),float(os.getenv("CRAWL_TIMEOUT_SECONDS","15")),os.getenv("CRAWL_SAME_DOMAIN_ONLY","true").lower()=="true")
 
+def _canon(u): p=urlparse(u); return f"{p.scheme}://{p.netloc}{p.path}" if p.scheme else u
 
-def _load_config():
-    return RuntimeConfig(os.getenv("DATABASE_URL","sqlite:///./collegecue_local.db"),int(os.getenv("CRAWL_MAX_PAGES_PER_SOURCE","25")),int(os.getenv("CRAWL_MAX_DEPTH","2")),float(os.getenv("CRAWL_RATE_LIMIT_SECONDS","2")),float(os.getenv("CRAWL_TIMEOUT_SECONDS","15")),os.getenv("CRAWL_SAME_DOMAIN_ONLY","true").lower()=="true")
-
-def _robots_allowed(url):
+def _robots(url):
     if url.startswith("file://"): return True
     p=urlparse(url); rp=robotparser.RobotFileParser(); rp.set_url(f"{p.scheme}://{p.netloc}/robots.txt")
-    try: rp.read()
+    try: rp.read(); return rp.can_fetch("ccdata-lite-bot",url)
     except Exception: return True
-    return rp.can_fetch("ccdata-lite-bot",url)
 
-def _canonical(url):
-    p=urlparse(url); return f"{p.scheme}://{p.netloc}{p.path}" if p.scheme else url
+def _ptype(u):
+    lu=u.lower()
+    for t,k in [("admission","admission"),("courses_fees","course"),("courses_fees","fees"),("faculty","faculty"),("placement","placement"),("hostel","hostel"),("gallery","gallery"),("contact","contact")]:
+        if k in lu: return t
+    if lu.endswith("index.html") or lu.rstrip('/').endswith(('.edu','.ac.in')): return "homepage"
+    return "unknown"
 
-def discover_urls(seed,cfg):
-    urls=[seed];
-    if seed.startswith("file://"):
-        txt=Path((urlparse(seed).netloc+urlparse(seed).path)).read_text(encoding="utf-8")
-    else:
-        txt=extract_fallback(seed, timeout=cfg.timeout)["meta"].get("raw_html","") if False else ""
+class Repo:
+    def __init__(self,db): self.path=db.replace("sqlite:///","")
+    def init(self):
+        with sqlite3.connect(self.path) as c:
+            c.execute("CREATE TABLE IF NOT EXISTS source_registry(id INTEGER PRIMARY KEY,entity_type TEXT,entity_name TEXT,official_url TEXT,trust_tier TEXT,is_active INTEGER DEFAULT 1)")
+            c.execute("CREATE TABLE IF NOT EXISTS crawler_records(id INTEGER PRIMARY KEY,entity_type TEXT,title TEXT,source_url TEXT UNIQUE,official_url TEXT,payload TEXT,missing_fields TEXT,confidence_score REAL,trust_tier TEXT,content_hash TEXT,last_crawled_at TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS quarantine_records(id INTEGER PRIMARY KEY,source_url TEXT,payload TEXT,reason TEXT,created_at TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY,entity_id INTEGER,field TEXT,alt_value TEXT,created_at TEXT)")
+            c.commit()
+    def add_source(self,e):
+        with sqlite3.connect(self.path) as c: c.execute("INSERT INTO source_registry(entity_type,entity_name,official_url,trust_tier,is_active) VALUES(?,?,?,?,1)",(e['entity_type'],e['entity_name'],e.get('url') or e.get('official_url'),e.get('trust_tier','official'))); c.commit()
+    def get_source(self,id):
+        with sqlite3.connect(self.path) as c: return c.execute("SELECT id,entity_type,entity_name,official_url,trust_tier FROM source_registry WHERE id=?",(id,)).fetchone()
+    def list_sources(self):
+        with sqlite3.connect(self.path) as c: return c.execute("SELECT id,entity_type,entity_name,official_url,trust_tier,is_active FROM source_registry").fetchall()
+    def save_entity(self, rec):
+        with sqlite3.connect(self.path) as c:
+            row=c.execute("SELECT id,payload,content_hash FROM crawler_records WHERE source_url=?",(rec['source_url'],)).fetchone()
+            if row and row[2]==rec['content_hash']: return 'unchanged'
+            if row:
+                old=json.loads(row[1]);
+                for k,v in rec['fields'].items():
+                    if old['fields'].get(k)!=v: c.execute("INSERT INTO audit_log(entity_id,field,alt_value,created_at) VALUES(?,?,?,?)",(row[0],k,json.dumps(old['fields'].get(k)),datetime.now(timezone.utc).isoformat()))
+                c.execute("UPDATE crawler_records SET payload=?,missing_fields=?,confidence_score=?,content_hash=?,last_crawled_at=? WHERE id=?",(json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['content_hash'],rec['last_crawled_at'],row[0]))
+                c.commit(); return 'updated'
+            c.execute("INSERT INTO crawler_records(entity_type,title,source_url,official_url,payload,missing_fields,confidence_score,trust_tier,content_hash,last_crawled_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(rec['entity_type'],rec['title'],rec['source_url'],rec['official_url'],json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['trust_tier'],rec['content_hash'],rec['last_crawled_at'])); c.commit(); return 'created'
+    def save_quarantine(self,source_url,payload,reason):
+        with sqlite3.connect(self.path) as c: c.execute("INSERT INTO quarantine_records(source_url,payload,reason,created_at) VALUES(?,?,?,?)",(source_url,json.dumps(payload),reason,datetime.now(timezone.utc).isoformat())); c.commit()
+    def get_entity(self,id):
+        with sqlite3.connect(self.path) as c: r=c.execute("SELECT id,payload FROM crawler_records WHERE id=?",(id,)).fetchone(); return json.loads(r[1]) if r else None
+
+def _clean_list(vals, headings):
+    out=[]
+    for v in vals or []:
+        s=" ".join(str(v).split()).strip()
+        if not s or s.lower() in headings: continue
+        if s not in out: out.append(s)
+    return out
+
+def discover(seed,cfg):
+    txt=Path((urlparse(seed).netloc+urlparse(seed).path)).read_text(encoding='utf-8') if seed.startswith('file://') else ''
     p=LinkParser(); p.feed(txt)
     base=urlparse(seed)
-    scored=[]
-    for l in p.links:
-        u=_canonical(urljoin(seed,l))
-        if cfg.same_domain and not u.startswith("file://") and urlparse(u).netloc!=base.netloc: continue
-        if any(u.lower().endswith(ext) for ext in [".pdf",".zip",".jpg",".png",".gif"]): continue
-        score=sum(1 for k in KEYWORDS if k in u.lower())
-        scored.append((score,u))
-    scored=sorted(set(scored), reverse=True)
-    urls.extend([u for _,u in scored][: cfg.max_pages-1])
-    return urls[:cfg.max_pages]
+    cand=[]
+    for h in p.links:
+        u=_canon(urljoin(seed,h)); lu=u.lower(); score=sum(2 for k in KEYWORDS if k in lu)
+        if cfg.same_domain and not u.startswith('file://') and urlparse(u).netloc!=base.netloc: continue
+        cand.append((score,u))
+    ded=[]; seen=set([seed])
+    for s,u in sorted(cand, reverse=True):
+        if u not in seen: ded.append({"url":u,"page_type":_ptype(u),"priority":s,"reason":"keyword_match" if s else "internal_link","robots_allowed":_robots(u)}); seen.add(u)
+    return [{"url":seed,"page_type":"homepage","priority":99,"reason":"seed","robots_allowed":_robots(seed)}]+ded[:cfg.max_pages-1]
 
-def map_record(entity_type, entity_name, source_url, extracted, trust_tier):
-    details=extracted.get('field_details',{})
-    def missing_field(f):
-        v=extracted.get(f)
-        has_detail=f in details
-        c=details.get(f,{}).get('confidence',1.0 if not has_detail else 0)
-        empty = v in (None,'',[],{})
-        return empty or c < 0.6
-    missing=[f for f in REQUIRED[entity_type] if missing_field(f)]
-    completeness=1-(len(missing)/max(1,len(REQUIRED[entity_type])))
-    recency=1.0
-    structured=1.0 if extracted.get('field_details') else 0.6
-    avg_field_conf = (sum(v.get('confidence',0) for v in details.values())/len(details)) if details else 1.0
-    confidence=round((completeness*0.45)+(TRUST.get(trust_tier,0.6)*0.25)+(recency*0.1)+(structured*0.1)+(avg_field_conf*0.1),3)
-    now=datetime.now(timezone.utc).isoformat()
-    return {"entity_type":entity_type,"title":extracted.get("name") or extracted.get("title") or entity_name,"source_url":source_url,"official_url":source_url,"summary":(extracted.get("meta",{}).get("meta_description") or "")[:300],"extracted_fields":extracted,"missing_fields":missing,"confidence_score":confidence,"trust_tier":trust_tier,"freshness_status":"incomplete" if missing else "fresh","content_hash":hashlib.sha256(json.dumps(extracted,sort_keys=True).encode()).hexdigest(),"last_crawled_at":now}
+def merge_pages(entity_type,name,official_url,pages,trust):
+    headings={"courses","placement","faculty","hostel","fees","admission","contact","gallery"}
+    merged={"name":name,"official_website":official_url,"location":"","courses":[],"fees":[],"admission_link":[],"placement":[],"faculty":[],"hostel":[],"gallery":[],"contact":[]}
+    field_src={}
+    for page in pages:
+        ex=page['extract'];
+        for f in ["location","courses","fees","admission_link","placement","faculty","hostel","gallery","contact"]:
+            val=ex.get(f)
+            conf=ex.get('field_details',{}).get(f,{}).get('confidence',0.5)
+            if isinstance(val,list): val=_clean_list(val, headings)
+            else: val=" ".join(str(val or '').split()).strip()
+            if not val: continue
+            existing=field_src.get(f,{"confidence":-1})
+            if conf>existing['confidence']:
+                merged[f]=val; field_src[f]={"source_url":page['url'],"confidence":conf,"method":ex.get('field_details',{}).get(f,{}).get('extraction_method','heuristic')}
+    missing=[f for f in REQ_COLLEGE if not merged.get(f)]
+    completeness=1-len(missing)/len(REQ_COLLEGE)
+    conf=round(completeness*0.6 + TRUST.get(trust,0.6)*0.25 + 0.15,3)
+    rec={"entity_type":entity_type,"title":merged.get('name') or name,"source_url":official_url,"official_url":official_url,"info":{"name":merged.get('name'),"location":merged.get('location'),"contact":merged.get('contact')},"courses_and_fees":{"courses":merged.get('courses'),"fees":merged.get('fees'),"admission_link":merged.get('admission_link')},"gallery":merged.get('gallery'),"faculty":merged.get('faculty'),"hostel":merged.get('hostel'),"placement":merged.get('placement'),"reviews":[],"metadata":{"field_sources":field_src,"page_count":len(pages)},"fields":merged,"missing_fields":missing,"confidence_score":conf,"trust_tier":trust,"content_hash":hashlib.sha256(json.dumps(merged,sort_keys=True).encode()).hexdigest(),"last_crawled_at":datetime.now(timezone.utc).isoformat()}
+    return rec
 
-def crawl_source(source_id:int):
-    cfg=_load_config(); repo=Repo(cfg.database_url); repo.init_db(); s=repo.get_source(source_id)
-    if not s: raise RuntimeError("source not found")
-    sid,etype,ename,url,_,trust,_,_=s
-    if not _robots_allowed(url): repo.log(sid,url,"blocked","robots"); return {"status":"blocked"}
-    crawled=[]
-    for u in discover_urls(url,cfg):
-        try:
-            extracted=extract_fallback(u, timeout=cfg.timeout)
-            rec=map_record("education_loan" if etype=="loan" else etype,ename,u,extracted,trust)
-            status=repo.upsert_record(rec)
-            if rec['missing_fields']:
-                candidates=discover_urls(url,cfg)
-                added=False
-                for ku in candidates:
-                    if any(k in ku.lower() for k in KEYWORDS):
-                        repo.add_task(sid,ku,"missing_fields"); added=True
-                if not added:
-                    repo.add_task(sid,url,"missing_fields")
-            repo.log(sid,u,status,rec['freshness_status'])
-            crawled.append({"url":u,"status":status,"missing":rec['missing_fields']})
-            time.sleep(cfg.rate if u.startswith('http') else 0)
-        except Exception as e:
-            repo.log(sid,u,"error",str(e))
-    return {"source_id":sid,"pages":len(crawled),"results":crawled}
+def crawl_source(id,dry=False):
+    cfg=_cfg(); repo=Repo(cfg.database_url); repo.init(); s=repo.get_source(id)
+    sid,etype,name,url,trust=s
+    pv=discover(url,cfg); pages=[]
+    for p in pv:
+        if not p['robots_allowed']: continue
+        ex=extract_fallback(p['url'], timeout=cfg.timeout); pages.append({"url":p['url'],"extract":ex,"page_type":p['page_type']})
+    rec=merge_pages(etype,name,url,pages,trust)
+    if dry: return {"dry_run":True,"pages":len(pages),"record":rec}
+    valid=rec['confidence_score']>=0.65 and (1-len(rec['missing_fields'])/len(REQ_COLLEGE))>=0.7 and rec['trust_tier'] in TRUST and rec['content_hash']
+    if valid: st=repo.save_entity(rec)
+    else: repo.save_quarantine(url,rec,"quality_gate_failed"); st='quarantined'
+    return {"source_id":sid,"status":st,"pages":len(pages),"missing":rec['missing_fields']}
+
+def export_entity(eid, fmt='json'):
+    repo=Repo(_cfg().database_url); repo.init(); rec=repo.get_entity(eid)
+    return rec
 
 def main():
-    p=argparse.ArgumentParser(); sub=p.add_subparsers(dest='cmd', required=True)
+    pa=argparse.ArgumentParser(); sub=pa.add_subparsers(dest='cmd',required=True)
     sub.add_parser('init-db')
-    sa=sub.add_parser('source:add'); sa.add_argument('--entity-type',required=True); sa.add_argument('--entity-name',required=True); sa.add_argument('--url',required=True); sa.add_argument('--country',default=''); sa.add_argument('--trust-tier',default='official'); sa.add_argument('--crawl-frequency-days',type=int,default=7)
+    a=sub.add_parser('source:add'); a.add_argument('--entity-type',required=True); a.add_argument('--entity-name',required=True); a.add_argument('--url',required=True); a.add_argument('--trust-tier',default='official')
     sub.add_parser('source:list')
-    sc=sub.add_parser('source:crawl'); sc.add_argument('--id',type=int,required=True)
-    sub.add_parser('source:crawl-active')
-    s1=sub.add_parser('crawl:single'); s1.add_argument('--url',required=True)
-    s2=sub.add_parser('extract:test'); s2.add_argument('--url',required=True)
-    s3=sub.add_parser('extract:debug'); s3.add_argument('--url',required=True)
-    args=p.parse_args(); cfg=_load_config(); repo=Repo(cfg.database_url); repo.init_db()
+    p=sub.add_parser('source:preview'); p.add_argument('--id',type=int,required=True)
+    c=sub.add_parser('source:crawl'); c.add_argument('--id',type=int,required=True); c.add_argument('--dry-run',action='store_true')
+    e=sub.add_parser('export:entity'); e.add_argument('--id',type=int,required=True); e.add_argument('--format',default='json')
+    t=sub.add_parser('extract:test'); t.add_argument('--url',required=True)
+    d=sub.add_parser('extract:debug'); d.add_argument('--url',required=True)
+    args=pa.parse_args(); repo=Repo(_cfg().database_url); repo.init()
     if args.cmd=='init-db': print('initialized')
     elif args.cmd=='source:add': repo.add_source(vars(args)); print('added')
     elif args.cmd=='source:list': print(json.dumps([{"id":r[0],"entity_type":r[1],"entity_name":r[2],"official_url":r[3],"trust_tier":r[4],"is_active":r[5]} for r in repo.list_sources()],indent=2))
-    elif args.cmd=='source:crawl': print(json.dumps(crawl_source(args.id),indent=2))
-    elif args.cmd=='source:crawl-active': print(json.dumps([crawl_source(r[0]) for r in repo.active_sources()],indent=2))
+    elif args.cmd=='source:preview': s=repo.get_source(args.id); print(json.dumps({"source_id":args.id,"estimated_page_count":len(discover(s[3],_cfg())),"urls":discover(s[3],_cfg())},indent=2))
+    elif args.cmd=='source:crawl': print(json.dumps(crawl_source(args.id,args.dry_run),indent=2))
+    elif args.cmd=='export:entity': print(json.dumps(export_entity(args.id,args.format),indent=2))
     elif args.cmd=='extract:test': print(json.dumps(extract_fallback(args.url),indent=2))
-    elif args.cmd=='extract:debug':
-        ex=extract_fallback(args.url)
-        rec=map_record('college','debug',args.url,ex,'official')
-        out={'detected_sections':ex.get('sections',{}),'extracted_fields':ex.get('field_details',{}),'missing_fields':rec['missing_fields'],'final_normalized_record':rec}
-        print(json.dumps(out,indent=2))
-    elif args.cmd=='crawl:single':
-        repo.add_source({'entity_type':'college','entity_name':'single','official_url':args.url,'country':'','trust_tier':'official','crawl_frequency_days':7})
-        sid=repo.list_sources()[-1][0]
-        print(json.dumps(crawl_source(sid),indent=2))
+    elif args.cmd=='extract:debug': ex=extract_fallback(args.url); rec=merge_pages('college','debug',args.url,[{"url":args.url,"extract":ex,"page_type":"homepage"}],'official'); print(json.dumps({"detected_sections":ex.get('sections',{}),"extracted_fields":ex.get('field_details',{}),"missing_fields":rec['missing_fields'],"final_normalized_record":rec},indent=2))
 
 if __name__=='__main__': main()
