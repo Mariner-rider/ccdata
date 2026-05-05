@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "collegecue-automation"
+version = "0.4.0"
+description = "Offline-friendly crawler and extraction pipeline"
+requires-python = ">=3.10"
+dependencies = [
+  "beautifulsoup4==4.13.3",
+  "lxml==5.3.1",
+]
+
+[project.optional-dependencies]
+webclaw = ["httpx==0.28.1", "tenacity==9.1.2"]
+postgres = ["psycopg[binary]==3.2.3"]
+redis = ["redis==5.2.1", "rq==1.16.2"]
+browser = ["playwright==1.54.0"]
+dev = ["pytest==8.3.5", "coverage==7.8.0", "ruff==0.11.7"]
+
+[tool.setuptools]
+packages = ["services"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
