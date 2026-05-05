@@ -1,0 +1,27 @@
+version: '3.9'
+services:
+  postgres:
+    image: postgres:16
+  redis:
+    image: redis:7
+  object-storage:
+    image: minio/minio:latest
+    command: server /data
+  queue-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+  core-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.core
+  browser-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.browser-worker
+    deploy:
+      replicas: 2
+  search:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.2
+  metrics:
+    image: prom/prometheus:latest
