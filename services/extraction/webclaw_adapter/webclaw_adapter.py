@@ -5,8 +5,22 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
-from tenacity import retry, stop_after_attempt, wait_fixed
+try:
+    import httpx
+except Exception:
+    httpx = None
+
+try:
+    from tenacity import retry, stop_after_attempt, wait_fixed
+except Exception:
+    def retry(*args, **kwargs):
+        def deco(fn):
+            return fn
+        return deco
+    def stop_after_attempt(*args, **kwargs):
+        return None
+    def wait_fixed(*args, **kwargs):
+        return None
 
 
 @dataclass
@@ -28,6 +42,8 @@ class WebClawAdapter:
 
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(0.4), reraise=True)
     def _request(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if httpx is None:
+            raise WebClawError("httpx is not installed")
         with httpx.Client(timeout=self.cfg.timeout_seconds) as client:
             r = client.post(url, json=payload)
             r.raise_for_status()

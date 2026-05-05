@@ -51,3 +51,7 @@ python -m services.lite_pipeline.main storage:cleanup
 - local-lite disk target: <10GB runtime
 - local-lite memory target: <4GB
 - local-lite image target: <5GB total (if possible)
+
+## No-Docker alternative
+For environments without Docker/Postgres/Redis, use `RUNTIME_PROFILE=no-docker` and SQLite (`DATABASE_URL=sqlite:///./collegecue_local.db`).
+Use `make validate-no-docker` for full offline validation.

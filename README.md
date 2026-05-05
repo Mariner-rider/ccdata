@@ -96,3 +96,8 @@ ALLOW_LARGE_IMAGES=true make docker-size-report
 - `docs/docker-optimization.md`
 - `docs/webclaw-integration.md`
 - `docs/data-pipeline.md`
+
+## No-Docker mode
+Use offline profile with SQLite and in-memory queue.
+Run `make init-db`, `make crawl-fixture`, and `make validate-no-docker`.
+WebClaw is optional and disabled by default in this profile.
