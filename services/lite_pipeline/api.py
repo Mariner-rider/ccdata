@@ -1,53 +1,61 @@
-from __future__ import annotations
-
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
 import os
+from services.lite_pipeline.main import Repo,_cfg,discover,crawl_source,export_entity,review_list,review_decide,publish_entity,chatbot_sync,record_approve,enqueue_job,job_get
 
-import psycopg
-import redis
-from fastapi import FastAPI
+app=FastAPI(title='collegecue-local-lite')
+ADMIN_API_KEY=os.getenv('ADMIN_API_KEY','')
 
-from services.extraction.webclaw_adapter.webclaw_adapter import WebClawAdapter, WebClawError
+def _guard(key):
+    if ADMIN_API_KEY and key!=ADMIN_API_KEY: raise HTTPException(status_code=401, detail='invalid admin api key')
 
-POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://crawler:crawler@postgres:5432/crawler")
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+class SourceIn(BaseModel):
+    entity_type:str='college'; entity_name:str; url:str; trust_tier:str='official'
 
-app = FastAPI(title="collegecue-local-lite")
+@app.get('/health')
+def health(): return {'status':'ok'}
+
+@app.post('/sources')
+def add_source(s:SourceIn, x_api_key:str|None=Header(default=None)):
+    _guard(x_api_key); repo=Repo(_cfg().database_url); repo.init(); sid=repo.add_source(s.model_dump()); return {'id':sid}
+
+@app.get('/sources')
+def list_sources():
+    repo=Repo(_cfg().database_url); repo.init(); return [{'id':r[0],'entity_type':r[1],'entity_name':r[2],'official_url':r[3]} for r in repo.list_sources()]
+
+@app.post('/sources/{id}/preview')
+def preview(id:int):
+    repo=Repo(_cfg().database_url); s=repo.get_source(id); return {'source_id':id,'urls':discover(s[3],_cfg(),repo)}
+
+@app.post('/sources/{id}/crawl')
+def crawl(id:int,dry_run:bool=True,idempotency_key:str|None=Header(default=None),x_api_key:str|None=Header(default=None)):
+    _guard(x_api_key); return enqueue_job(id,'crawl',dry_run,5,None,idempotency_key)
+
+@app.get('/records/{id}/export')
+def export(id:int): return export_entity(id)
+
+@app.get('/review')
+def review(): return review_list()
+
+@app.post('/review/{id}/approve')
+def appr(id:int,reviewed_by:str='admin'): return review_decide(id,'approved',reviewed_by)
+
+@app.post('/review/{id}/reject')
+def rej(id:int,reviewed_by:str='admin',notes:str=''): return review_decide(id,'rejected',reviewed_by,notes)
+
+@app.post('/records/{id}/publish')
+def pub(id:int, idempotency_key:str|None=Header(default=None), x_api_key:str|None=Header(default=None)):
+    _guard(x_api_key); return publish_entity(id,idempotency_key)
+
+@app.post('/chatbot/sync/{entity_id}')
+def sync(entity_id:int, idempotency_key:str|None=Header(default=None), x_api_key:str|None=Header(default=None)):
+    _guard(x_api_key); return chatbot_sync(entity_id,idempotency_key)
+
+@app.post('/records/{id}/approve')
+def approve_record(id:int,reviewed_by:str='admin', x_api_key:str|None=Header(default=None)):
+    _guard(x_api_key); return record_approve(id,reviewed_by)
 
 
-@app.get("/health")
-def health() -> dict:
-    return {"status": "ok"}
-
-
-@app.get("/health/db")
-def health_db() -> dict:
-    try:
-        with psycopg.connect(POSTGRES_DSN) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                cur.fetchone()
-        return {"status": "ok"}
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "error", "error": str(exc)}
-
-
-@app.get("/health/redis")
-def health_redis() -> dict:
-    try:
-        r = redis.from_url(REDIS_URL)
-        r.ping()
-        return {"status": "ok"}
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "error", "error": str(exc)}
-
-
-@app.get("/health/webclaw")
-def health_webclaw() -> dict:
-    a = WebClawAdapter()
-    if not a.cfg.enabled:
-        return {"status": "disabled", "enabled": False}
-    try:
-        a.scrape("https://example.com")
-        return {"status": "ok", "enabled": True}
-    except WebClawError as exc:
-        return {"status": "degraded", "enabled": False, "detail": str(exc)}
+@app.get('/jobs/{id}')
+def job(id:int):
+    return job_get(id)

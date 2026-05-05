@@ -1,16 +1,24 @@
 from __future__ import annotations
 import argparse, hashlib, json, os, sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from urllib import robotparser
 from services.extraction.webclaw_adapter.fallback_extractor import extract_fallback
+try:
+    import psycopg
+except Exception:
+    psycopg=None
+try:
+    import redis
+except Exception:
+    redis=None
 
 TRUST={"official":1.0,"government/regulator":0.95,"recognized news":0.75,"aggregator":0.60,"user/review":0.40}
 REQ_COLLEGE=["name","location","official_website","courses","fees","admission_link","placement","faculty","hostel"]
-KEYWORDS=["admission","courses","fees","placement","faculty","hostel","infrastructure","scholarship","contact","about"]
+KEYWORDS=["admission","admissions","programme","program","academics","departments","courses","fees","fee-structure","fee","placement","placements","career-development","career","faculty","people","hostel","campus-life","infrastructure","scholarship","contact","directory","about","overview"]
 LABELS=["Faculty:","Hostel:","Placement:","Contact:","Fees:","Courses:","Address:","Location:","Admission:"]
 GENERIC_HEADINGS={"courses & fees","courses and fees","placements","placement","faculty","hostel","contact","admissions","admission","gallery","infrastructure","about","overview","reviews","scholarships"}
 
@@ -27,6 +35,48 @@ class Cfg: database_url:str; max_pages:int; timeout:float; same_domain:bool; all
 def _cfg():
     allowed={d.strip() for d in os.getenv("CRAWL_ALLOWED_DOMAINS","").split(',') if d.strip()}
     return Cfg(os.getenv("DATABASE_URL","sqlite:///./collegecue_local.db"),int(os.getenv("CRAWL_MAX_PAGES_PER_SOURCE","25")),float(os.getenv("CRAWL_TIMEOUT_SECONDS","15")),os.getenv("CRAWL_SAME_DOMAIN_ONLY","true").lower()=="true",allowed)
+
+
+
+def _is_pg():
+    return _cfg().database_url.startswith('postgresql://')
+
+def _exec_sql(sql, params=()):
+    db=_cfg().database_url
+    if db.startswith('sqlite:///'):
+        with sqlite3.connect(Repo(db).path) as c:
+            cur=c.execute(sql, params); c.commit(); return cur.fetchall() if sql.strip().lower().startswith('select') else []
+    if db.startswith('postgresql://'):
+        if psycopg is None: raise RuntimeError('psycopg not installed for postgresql path')
+        with psycopg.connect(db) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                out=cur.fetchall() if sql.strip().lower().startswith('select') else []
+            conn.commit(); return out
+    raise RuntimeError('unsupported DATABASE_URL')
+
+MIGRATIONS=[
+"CREATE TABLE IF NOT EXISTS source_registry(id SERIAL PRIMARY KEY,entity_type TEXT,entity_name TEXT,official_url TEXT,trust_tier TEXT,is_active INTEGER DEFAULT 1)",
+"CREATE TABLE IF NOT EXISTS crawler_records(id SERIAL PRIMARY KEY,entity_type TEXT,title TEXT,source_url TEXT UNIQUE,official_url TEXT,payload TEXT,missing_fields TEXT,confidence_score REAL,trust_tier TEXT,content_hash TEXT,last_crawled_at TEXT)",
+"CREATE TABLE IF NOT EXISTS crawl_logs(id SERIAL PRIMARY KEY,source_url TEXT,status TEXT,detail TEXT,event_ts TEXT)",
+"CREATE TABLE IF NOT EXISTS crawl_tasks(id SERIAL PRIMARY KEY,source_id INTEGER,url TEXT,reason TEXT,created_at TEXT)",
+"CREATE TABLE IF NOT EXISTS audit_logs(id SERIAL PRIMARY KEY,entity_record_id INTEGER,action TEXT,notes TEXT,reviewed_by TEXT,created_at TEXT)",
+"CREATE TABLE IF NOT EXISTS quarantine_records(id SERIAL PRIMARY KEY,source_url TEXT,payload TEXT,reason TEXT,created_at TEXT)",
+"CREATE TABLE IF NOT EXISTS review_queue(id SERIAL PRIMARY KEY,entity_record_id INTEGER,entity_type TEXT,title TEXT,confidence_score REAL,missing_fields TEXT,quality_gate_status TEXT,suggested_action TEXT,created_at TEXT,reviewed_at TEXT,reviewed_by TEXT,decision TEXT,notes TEXT)",
+"CREATE TABLE IF NOT EXISTS published_records(id SERIAL PRIMARY KEY,entity_record_id INTEGER,version INTEGER,payload TEXT,published_at TEXT,idempotency_key TEXT)",
+"CREATE TABLE IF NOT EXISTS chatbot_sync_logs(id SERIAL PRIMARY KEY,entity_record_id INTEGER,title TEXT,published_version INTEGER,fields_synced TEXT,status TEXT,created_at TEXT,idempotency_key TEXT)",
+]
+
+def db_migrate():
+    for m in MIGRATIONS: _exec_sql(m)
+    return {'ok':True,'applied':len(MIGRATIONS)}
+
+def db_status():
+    if _cfg().database_url.startswith('sqlite:///'):
+        path=Repo(_cfg().database_url).path
+        exists=Path(path).exists()
+        return {'database_url':_cfg().database_url,'backend':'sqlite','file_exists':exists,'migrations_known':len(MIGRATIONS)}
+    return {'database_url':_cfg().database_url,'backend':'postgresql','psycopg_installed':psycopg is not None,'migrations_known':len(MIGRATIONS)}
 
 def _canon(u): p=urlparse(u); return f"{p.scheme}://{p.netloc}{p.path}" if p.scheme else u
 
@@ -46,10 +96,23 @@ class Repo:
     def __init__(self,db): self.path=db.replace("sqlite:///","")
     def init(self):
         with sqlite3.connect(self.path) as c:
-            c.execute("CREATE TABLE IF NOT EXISTS source_registry(id INTEGER PRIMARY KEY,entity_type TEXT,entity_name TEXT,official_url TEXT,trust_tier TEXT,is_active INTEGER DEFAULT 1)")
+            c.execute("CREATE TABLE IF NOT EXISTS source_registry(id INTEGER PRIMARY KEY,entity_type TEXT,entity_name TEXT,official_url TEXT,trust_tier TEXT,is_active INTEGER DEFAULT 1,last_crawled_at TEXT,crawl_frequency_days INTEGER DEFAULT 7)")
             c.execute("CREATE TABLE IF NOT EXISTS crawler_records(id INTEGER PRIMARY KEY,entity_type TEXT,title TEXT,source_url TEXT UNIQUE,official_url TEXT,payload TEXT,missing_fields TEXT,confidence_score REAL,trust_tier TEXT,content_hash TEXT,last_crawled_at TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS quarantine_records(id INTEGER PRIMARY KEY,source_url TEXT,payload TEXT,reason TEXT,created_at TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS crawl_logs(id INTEGER PRIMARY KEY,source_url TEXT,status TEXT,detail TEXT,event_ts TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS review_queue(id INTEGER PRIMARY KEY,entity_record_id INTEGER,entity_type TEXT,title TEXT,confidence_score REAL,missing_fields TEXT,quality_gate_status TEXT,suggested_action TEXT,created_at TEXT,reviewed_at TEXT,reviewed_by TEXT,decision TEXT,notes TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS published_records(id INTEGER PRIMARY KEY,entity_record_id INTEGER,version INTEGER,payload TEXT,published_at TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS chatbot_sync_logs(id INTEGER PRIMARY KEY,entity_record_id INTEGER,title TEXT,published_version INTEGER,fields_synced TEXT,status TEXT,created_at TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY,entity_record_id INTEGER,action TEXT,notes TEXT,reviewed_by TEXT,created_at TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS crawl_jobs(id INTEGER PRIMARY KEY,source_id INTEGER,job_type TEXT,status TEXT,dry_run INTEGER,priority INTEGER,payload_json TEXT,result_json TEXT,error_message TEXT,idempotency_key TEXT,created_at TEXT,started_at TEXT,completed_at TEXT,retry_count INTEGER DEFAULT 0,next_retry_at TEXT,last_error TEXT)")
+
+            try: c.execute('ALTER TABLE published_records ADD COLUMN idempotency_key TEXT')
+            except Exception: pass
+            try: c.execute('ALTER TABLE chatbot_sync_logs ADD COLUMN idempotency_key TEXT')
+            except Exception: pass
+            for q in ["ALTER TABLE source_registry ADD COLUMN last_crawled_at TEXT","ALTER TABLE source_registry ADD COLUMN crawl_frequency_days INTEGER DEFAULT 7","ALTER TABLE crawl_jobs ADD COLUMN retry_count INTEGER DEFAULT 0","ALTER TABLE crawl_jobs ADD COLUMN next_retry_at TEXT","ALTER TABLE crawl_jobs ADD COLUMN last_error TEXT"]:
+                try: c.execute(q)
+                except Exception: pass
             c.commit()
     def log(self,u,s,d):
         with sqlite3.connect(self.path) as c: c.execute("INSERT INTO crawl_logs(source_url,status,detail,event_ts) VALUES(?,?,?,?)",(u,s,d,datetime.now(timezone.utc).isoformat())); c.commit()
@@ -65,7 +128,13 @@ class Repo:
             if row and row[1]==rec['content_hash']: return 'unchanged'
             if row:
                 c.execute("UPDATE crawler_records SET payload=?,missing_fields=?,confidence_score=?,content_hash=?,last_crawled_at=? WHERE id=?",(json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['content_hash'],rec['last_crawled_at'],row[0])); c.commit(); return 'updated'
-            c.execute("INSERT INTO crawler_records(entity_type,title,source_url,official_url,payload,missing_fields,confidence_score,trust_tier,content_hash,last_crawled_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(rec['entity_type'],rec['title'],rec['source_url'],rec['official_url'],json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['trust_tier'],rec['content_hash'],rec['last_crawled_at'])); c.commit(); return 'created'
+            state='draft' if (not rec['missing_fields'] and rec['confidence_score']>=0.85) else 'needs_review'
+            rec['lifecycle_state']=state
+            c.execute("INSERT INTO crawler_records(entity_type,title,source_url,official_url,payload,missing_fields,confidence_score,trust_tier,content_hash,last_crawled_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(rec['entity_type'],rec['title'],rec['source_url'],rec['official_url'],json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['trust_tier'],rec['content_hash'],rec['last_crawled_at']))
+            rid=c.execute('select last_insert_rowid()').fetchone()[0]
+            if state=='needs_review':
+                c.execute("INSERT INTO review_queue(entity_record_id,entity_type,title,confidence_score,missing_fields,quality_gate_status,suggested_action,created_at) VALUES(?,?,?,?,?,?,?,?)",(rid,rec['entity_type'],rec['title'],rec['confidence_score'],json.dumps(rec['missing_fields']),'fail','review',datetime.now(timezone.utc).isoformat()))
+            c.commit(); return 'created'
     def save_quarantine(self,source_url,payload,reason):
         with sqlite3.connect(self.path) as c: c.execute("INSERT INTO quarantine_records(source_url,payload,reason,created_at) VALUES(?,?,?,?)",(source_url,json.dumps(payload),reason,datetime.now(timezone.utc).isoformat())); c.commit()
     def get_entity(self,id):
@@ -191,9 +260,261 @@ def pilot_http_smoke(url,name):
     if old2 is not None: os.environ['CRAWL_SAME_DOMAIN_ONLY']=old2
     return {"safe_completed":True,"quality_report":out.get('quality_report',{}),"compliance_log":comp}
 
+
+
+def review_list():
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c:
+        rows=c.execute("SELECT id,entity_record_id,title,confidence_score,missing_fields,decision FROM review_queue ORDER BY id DESC").fetchall()
+    return [dict(id=r[0],entity_record_id=r[1],title=r[2],confidence_score=r[3],missing_fields=json.loads(r[4] or '[]'),decision=r[5]) for r in rows]
+
+def review_show(i):
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c:
+        r=c.execute("SELECT * FROM review_queue WHERE id=?",(i,)).fetchone();
+    return r
+
+def review_decide(i,decision,reviewed_by,notes=''):
+    repo=Repo(_cfg().database_url); repo.init()
+    with sqlite3.connect(repo.path) as c:
+        r=c.execute("SELECT entity_record_id FROM review_queue WHERE id=?",(i,)).fetchone()
+        if not r: raise RuntimeError('review not found')
+        c.execute("UPDATE review_queue SET reviewed_at=?,reviewed_by=?,decision=?,notes=? WHERE id=?",(datetime.now(timezone.utc).isoformat(),reviewed_by,decision,notes,i))
+        pr=c.execute("SELECT payload FROM crawler_records WHERE id=?",(r[0],)).fetchone(); rec=json.loads(pr[0]); rec['lifecycle_state']='approved' if decision=='approved' else 'rejected'
+        c.execute("UPDATE crawler_records SET payload=? WHERE id=?",(json.dumps(rec),r[0])); c.commit()
+    return {'ok':True,'decision':decision}
+
+def publish_entity(i,idempotency_key=None):
+    repo=Repo(_cfg().database_url); repo.init()
+    with sqlite3.connect(repo.path) as c:
+        pr=c.execute("SELECT payload FROM crawler_records WHERE id=?",(i,)).fetchone();
+        if not pr: raise RuntimeError('record not found')
+        rec=json.loads(pr[0])
+        if rec.get('lifecycle_state')!='approved':
+            raise RuntimeError(f"invalid state: {rec.get('lifecycle_state')}; next_action=record:approve")
+        if idempotency_key:
+            ex=c.execute("SELECT version FROM published_records WHERE entity_record_id=? AND idempotency_key=? ORDER BY version DESC LIMIT 1",(i,idempotency_key)).fetchone()
+            if ex: return {'entity_id':i,'version':ex[0],'status':'published','idempotent':True}
+        v=(c.execute("SELECT COALESCE(MAX(version),0) FROM published_records WHERE entity_record_id=?",(i,)).fetchone()[0])+1
+        rec['lifecycle_state']='published'
+        c.execute("UPDATE crawler_records SET payload=? WHERE id=?",(json.dumps(rec),i))
+        c.execute("INSERT INTO published_records(entity_record_id,version,payload,published_at,idempotency_key) VALUES(?,?,?,?,?)",(i,v,json.dumps(rec),datetime.now(timezone.utc).isoformat(),idempotency_key)); c.commit()
+    return {'entity_id':i,'version':v,'status':'published'}
+
+def publish_list():
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c: rows=c.execute("SELECT entity_record_id,version,published_at FROM published_records ORDER BY id DESC").fetchall()
+    return [dict(entity_id=r[0],version=r[1],published_at=r[2]) for r in rows]
+
+def chatbot_sync(eid,idempotency_key=None):
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c:
+        r=c.execute("SELECT version,payload FROM published_records WHERE entity_record_id=? ORDER BY version DESC LIMIT 1",(eid,)).fetchone()
+        if not r: raise RuntimeError('not published; next_action=publish:entity')
+        if idempotency_key:
+            ex=c.execute("SELECT id,published_version,status FROM chatbot_sync_logs WHERE entity_record_id=? AND idempotency_key=? ORDER BY id DESC LIMIT 1",(eid,idempotency_key)).fetchone()
+            if ex: return {'entity_id':eid,'published_version':ex[1],'status':ex[2],'idempotent':True}
+        rec=json.loads(r[1]); fields=list(rec.get('fields',{}).keys())
+        c.execute("INSERT INTO chatbot_sync_logs(entity_record_id,title,published_version,fields_synced,status,created_at,idempotency_key) VALUES(?,?,?,?,?,?,?)",(eid,rec.get('title'),r[0],json.dumps(fields),'queued',datetime.now(timezone.utc).isoformat(),idempotency_key)); c.commit()
+    return {'entity_id':eid,'published_version':r[0],'fields_synced':fields,'status':'queued'}
+
+
+
+def record_list(state=None):
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c:
+        rows=c.execute('SELECT id,payload FROM crawler_records').fetchall()
+    out=[]
+    for i,p in rows:
+        rec=json.loads(p); st=rec.get('lifecycle_state','')
+        if state and st!=state: continue
+        out.append({'id':i,'title':rec.get('title'),'state':st,'confidence_score':rec.get('confidence_score')})
+    return out
+
+def record_show(i):
+    return export_entity(i)
+
+def _audit(i,action,notes,reviewed_by):
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c:
+        c.execute('INSERT INTO audit_logs(entity_record_id,action,notes,reviewed_by,created_at) VALUES(?,?,?,?,?)',(i,action,notes,reviewed_by,datetime.now(timezone.utc).isoformat())); c.commit()
+
+def review_seed(entity_id):
+    repo=Repo(_cfg().database_url); repo.init()
+    with sqlite3.connect(repo.path) as c:
+        pr=c.execute('SELECT payload,entity_type,title,confidence_score,missing_fields FROM crawler_records WHERE id=?',(entity_id,)).fetchone()
+        if not pr: raise RuntimeError('record not found')
+        rec=json.loads(pr[0]); st=rec.get('lifecycle_state')
+        if st not in {'draft','needs_review','approved'}: raise RuntimeError('seed only for draft/needs_review')
+        ex=c.execute('SELECT id FROM review_queue WHERE entity_record_id=?',(entity_id,)).fetchone()
+        if not ex:
+            c.execute('INSERT INTO review_queue(entity_record_id,entity_type,title,confidence_score,missing_fields,quality_gate_status,suggested_action,created_at) VALUES(?,?,?,?,?,?,?,?)',(entity_id,pr[1],pr[2],pr[3],pr[4],'manual','review',datetime.now(timezone.utc).isoformat())); c.commit()
+    return {'ok':True,'entity_id':entity_id}
+
+def record_approve(entity_id,reviewed_by,force=False):
+    repo=Repo(_cfg().database_url); repo.init()
+    with sqlite3.connect(repo.path) as c:
+        pr=c.execute('SELECT payload FROM crawler_records WHERE id=?',(entity_id,)).fetchone()
+        if not pr: raise RuntimeError('record not found')
+        rec=json.loads(pr[0]); st=rec.get('lifecycle_state')
+        if st=='rejected' and not force: raise RuntimeError('rejected requires --force')
+        if st=='quarantine': raise RuntimeError('quarantine cannot be approved')
+        rec['lifecycle_state']='approved'
+        c.execute('UPDATE crawler_records SET payload=? WHERE id=?',(json.dumps(rec),entity_id)); c.commit()
+    review_seed(entity_id)
+    _audit(entity_id,'record_approve','',reviewed_by)
+    return {'ok':True,'entity_id':entity_id,'state':'approved'}
+
+def record_reject(entity_id,reviewed_by,notes=''):
+    repo=Repo(_cfg().database_url); repo.init()
+    with sqlite3.connect(repo.path) as c:
+        pr=c.execute('SELECT payload FROM crawler_records WHERE id=?',(entity_id,)).fetchone()
+        if not pr: raise RuntimeError('record not found')
+        rec=json.loads(pr[0]); st=rec.get('lifecycle_state')
+        if st=='published': raise RuntimeError('published cannot be rejected directly')
+        rec['lifecycle_state']='rejected'
+        c.execute('UPDATE crawler_records SET payload=? WHERE id=?',(json.dumps(rec),entity_id)); c.commit()
+    _audit(entity_id,'record_reject',notes,reviewed_by)
+    return {'ok':True,'entity_id':entity_id,'state':'rejected'}
+
+
+
+class MemoryQueueBackend:
+    def enqueue(self, job_id): return True
+
+class RedisQueueBackend:
+    def __init__(self):
+        if redis is None: raise RuntimeError('redis dependency missing')
+        self.r=redis.from_url(os.getenv('REDIS_URL','redis://localhost:6379/0'))
+    def enqueue(self, job_id):
+        self.r.rpush('crawl_jobs', job_id); return True
+
+def _queue_backend():
+    b=os.getenv('QUEUE_BACKEND','memory')
+    return RedisQueueBackend() if b=='redis' else MemoryQueueBackend()
+
+def enqueue_job(source_id,job_type='crawl',dry_run=False,priority=5,payload=None,idempotency_key=None):
+    repo=Repo(_cfg().database_url); repo.init()
+    if not isinstance(idempotency_key,str):
+        idempotency_key=None
+    with sqlite3.connect(repo.path) as c:
+        if idempotency_key:
+            ex=c.execute('SELECT id,status FROM crawl_jobs WHERE idempotency_key=? ORDER BY id DESC LIMIT 1',(idempotency_key,)).fetchone()
+            if ex: return {'job_id':ex[0],'status':ex[1],'idempotent':True}
+        c.execute('INSERT INTO crawl_jobs(source_id,job_type,status,dry_run,priority,payload_json,idempotency_key,created_at) VALUES(?,?,?,?,?,?,?,?)',(source_id,job_type,'queued',1 if dry_run else 0,priority,json.dumps(payload or {}),idempotency_key,datetime.now(timezone.utc).isoformat()))
+        jid=c.execute('select last_insert_rowid()').fetchone()[0]; c.commit()
+    _queue_backend().enqueue(jid)
+    return {'job_id':jid,'status':'queued'}
+
+def job_get(i):
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c:
+        r=c.execute('SELECT id,source_id,job_type,status,dry_run,priority,payload_json,result_json,error_message,created_at,started_at,completed_at FROM crawl_jobs WHERE id=?',(i,)).fetchone()
+    if not r: return None
+    return {'id':r[0],'source_id':r[1],'job_type':r[2],'status':r[3],'dry_run':bool(r[4]),'priority':r[5],'payload_json':json.loads(r[6] or '{}'),'result_json':json.loads(r[7] or '{}') if r[7] else None,'error_message':r[8],'created_at':r[9],'started_at':r[10],'completed_at':r[11]}
+
+def jobs_list():
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c: rows=c.execute('SELECT id,source_id,job_type,status,created_at FROM crawl_jobs ORDER BY id DESC').fetchall()
+    return [dict(id=r[0],source_id=r[1],job_type=r[2],status=r[3],created_at=r[4]) for r in rows]
+
+def jobs_cancel(i):
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c:
+        c.execute("UPDATE crawl_jobs SET status='cancelled',completed_at=? WHERE id=? AND status in ('queued','running')",(datetime.now(timezone.utc).isoformat(),i))
+        c.execute("INSERT INTO audit_logs(entity_record_id,action,notes,reviewed_by,created_at) VALUES(?,?,?,?,?)",(i,'job_cancel','cancelled via jobs:cancel','system',datetime.now(timezone.utc).isoformat()))
+        c.commit()
+    return {'ok':True,'job_id':i}
+
+def worker_once():
+    repo=Repo(_cfg().database_url); repo.init()
+    with sqlite3.connect(repo.path) as c:
+        r=c.execute("SELECT id,source_id,dry_run,retry_count FROM crawl_jobs WHERE status='queued' AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY priority DESC,id ASC LIMIT 1",(datetime.now(timezone.utc).isoformat(),)).fetchone()
+        if not r: return {'processed':0}
+        jid,sid,dry,retry_count=r
+        c.execute("UPDATE crawl_jobs SET status='running',started_at=? WHERE id=?",(datetime.now(timezone.utc).isoformat(),jid)); c.commit()
+    try:
+        result=crawl_source(sid,bool(dry))
+        with sqlite3.connect(repo.path) as c:
+            c.execute("UPDATE crawl_jobs SET status='completed',result_json=?,completed_at=? WHERE id=?",(json.dumps(result),datetime.now(timezone.utc).isoformat(),jid)); c.commit()
+        return {'processed':1,'job_id':jid,'status':'completed'}
+    except Exception as e:
+        with sqlite3.connect(repo.path) as c:
+            maxr=2
+            if retry_count<maxr:
+                back=2**retry_count
+                nr=(datetime.now(timezone.utc)+timedelta(minutes=back)).isoformat()
+                c.execute("UPDATE crawl_jobs SET status='queued',retry_count=retry_count+1,last_error=?,next_retry_at=? WHERE id=?",(str(e),nr,jid))
+                c.commit(); return {'processed':1,'job_id':jid,'status':'retry_queued','retry_count':retry_count+1}
+            c.execute("UPDATE crawl_jobs SET status='failed',error_message=?,last_error=?,completed_at=? WHERE id=?",(str(e),str(e),datetime.now(timezone.utc).isoformat(),jid)); c.commit()
+        return {'processed':1,'job_id':jid,'status':'failed'}
+
+def worker_run():
+    out=[]
+    while True:
+        r=worker_once(); out.append(r)
+        if r.get('processed',0)==0: break
+    return {'runs':out}
+
+
+
+def _env_int(k,d):
+    try:return int(os.getenv(k,str(d)))
+    except:return d
+
+def _job_priority(job_type):
+    return {'registration':100,'missing_fields':90,'admissions':80,'jobs':80,'news':80,'refresh':60}.get(job_type,50)
+
+def _recover_stale_jobs():
+    stale=_env_int('JOB_STALE_MINUTES',30)
+    now=datetime.now(timezone.utc)
+    with sqlite3.connect(Repo(_cfg().database_url).path) as c:
+        rows=c.execute("SELECT id,started_at,retry_count FROM crawl_jobs WHERE status='running' AND started_at IS NOT NULL").fetchall()
+        for jid,st,rc in rows:
+            try: stt=datetime.fromisoformat(st)
+            except: continue
+            if (now-stt).total_seconds()>stale*60:
+                if rc<2:
+                    c.execute("UPDATE crawl_jobs SET status='queued',retry_count=retry_count+1,started_at=NULL,last_error='stale_requeue' WHERE id=?",(jid,))
+                else:
+                    c.execute("UPDATE crawl_jobs SET status='failed',last_error='stale_failed',completed_at=? WHERE id=?",(now.isoformat(),jid))
+        c.commit()
+
+def scheduler_run_once():
+    _recover_stale_jobs()
+    repo=Repo(_cfg().database_url); repo.init(); enq=[]
+    daily=_env_int('DAILY_MAX_JOBS',200); per_domain=_env_int('DAILY_MAX_JOBS_PER_DOMAIN',20); max_failed=_env_int('MAX_FAILED_JOBS_PER_SOURCE',3); cooldown=_env_int('CRAWL_COOLDOWN_HOURS_AFTER_FAILURE',24)
+    report={'sources_checked':0,'jobs_enqueued':0,'skipped_not_due':0,'skipped_budget':0,'skipped_cooldown':0,'failed_sources_blocked':0}
+    now=datetime.now(timezone.utc)
+    with sqlite3.connect(repo.path) as c:
+        src=c.execute('SELECT id,official_url,last_crawled_at,COALESCE(crawl_frequency_days,7) FROM source_registry WHERE is_active=1').fetchall()
+        jobs_today=c.execute("SELECT count(*) FROM crawl_jobs WHERE date(created_at)=date('now')").fetchone()[0]
+        domain_counts={r[0]:r[1] for r in c.execute("SELECT substr(json_extract(payload_json,'$.domain'),1),count(*) FROM crawl_jobs WHERE date(created_at)=date('now') GROUP BY 1").fetchall() if r[0]}
+        for sid,url,last,days in src:
+            report['sources_checked']+=1
+            if jobs_today>=daily: report['skipped_budget']+=1; continue
+            domain=urlparse(url).netloc
+            if domain and domain_counts.get(domain,0)>=per_domain: report['skipped_budget']+=1; continue
+            due=False
+            if not last: due=True
+            else:
+                try: due=(now-datetime.fromisoformat(last)).total_seconds()>=int(days)*86400
+                except: due=True
+            if not due: report['skipped_not_due']+=1; continue
+            f=c.execute("SELECT count(*),max(completed_at) FROM crawl_jobs WHERE source_id=? AND status='failed'",(sid,)).fetchone()
+            if f[0]>=max_failed: report['failed_sources_blocked']+=1; continue
+            if f[1]:
+                try:
+                    if (now-datetime.fromisoformat(f[1])).total_seconds()<cooldown*3600: report['skipped_cooldown']+=1; continue
+                except: pass
+            j=enqueue_job(sid,'refresh',False,_job_priority('refresh'),{'domain':domain})
+            enq.append(j); jobs_today+=1; domain_counts[domain]=domain_counts.get(domain,0)+1; report['jobs_enqueued']+=1
+    report['enqueued']=enq
+    return report
+
 def main():
     pa=argparse.ArgumentParser(); sub=pa.add_subparsers(dest='cmd',required=True)
     sub.add_parser('init-db')
+    sub.add_parser('db:migrate')
+    sub.add_parser('db:status')
+    sub.add_parser('worker:run')
+    sub.add_parser('worker:once')
+    sub.add_parser('jobs:list')
+    jsh=sub.add_parser('jobs:show'); jsh.add_argument('--id',type=int,required=True)
+    jca=sub.add_parser('jobs:cancel'); jca.add_argument('--id',type=int,required=True)
+    sca=sub.add_parser('source:crawl-async'); sca.add_argument('--id',type=int,required=True); sca.add_argument('--dry-run',action='store_true'); sca.add_argument('--idempotency-key',default=None)
+    sub.add_parser('scheduler:run-once')
     a=sub.add_parser('source:add'); a.add_argument('--entity-type',required=True); a.add_argument('--entity-name',required=True); a.add_argument('--url',required=True); a.add_argument('--trust-tier',default='official')
     sub.add_parser('source:list')
     p=sub.add_parser('source:preview'); p.add_argument('--id',type=int,required=True)
@@ -206,8 +527,29 @@ def main():
     ev=sub.add_parser('export:validate'); ev.add_argument('--id',type=int,required=True)
     sub.add_parser('readiness:check')
     ae=sub.add_parser('audit:export'); ae.add_argument('--format',default='json')
+    sub.add_parser('review:list')
+    rs=sub.add_parser('review:show'); rs.add_argument('--id',type=int,required=True)
+    ra=sub.add_parser('review:approve'); ra.add_argument('--id',type=int,required=True); ra.add_argument('--reviewed-by',required=True)
+    rr=sub.add_parser('review:reject'); rr.add_argument('--id',type=int,required=True); rr.add_argument('--reviewed-by',required=True); rr.add_argument('--notes',default='')
+    pe=sub.add_parser('publish:entity'); pe.add_argument('--id',type=int,required=True); pe.add_argument('--idempotency-key',default=None)
+    sub.add_parser('publish:list')
+    cs=sub.add_parser('chatbot:sync'); cs.add_argument('--entity-id',type=int,required=True); cs.add_argument('--idempotency-key',default=None)
+    rl=sub.add_parser('record:list'); rl.add_argument('--state',default=None)
+    rsh=sub.add_parser('record:show'); rsh.add_argument('--id',type=int,required=True)
+    rap=sub.add_parser('record:approve'); rap.add_argument('--id',type=int,required=True); rap.add_argument('--reviewed-by',required=True); rap.add_argument('--force',action='store_true')
+    rrj=sub.add_parser('record:reject'); rrj.add_argument('--id',type=int,required=True); rrj.add_argument('--reviewed-by',required=True); rrj.add_argument('--notes',default='')
+    rsd=sub.add_parser('review:seed'); rsd.add_argument('--entity-id',type=int,required=True)
     args=pa.parse_args(); repo=Repo(_cfg().database_url); repo.init()
     if args.cmd=='init-db': print('initialized')
+    elif args.cmd=='db:migrate': print(json.dumps(db_migrate(),indent=2))
+    elif args.cmd=='db:status': print(json.dumps(db_status(),indent=2))
+    elif args.cmd=='worker:run': print(json.dumps(worker_run(),indent=2))
+    elif args.cmd=='worker:once': print(json.dumps(worker_once(),indent=2))
+    elif args.cmd=='jobs:list': print(json.dumps(jobs_list(),indent=2))
+    elif args.cmd=='jobs:show': print(json.dumps(job_get(args.id),indent=2))
+    elif args.cmd=='jobs:cancel': print(json.dumps(jobs_cancel(args.id),indent=2))
+    elif args.cmd=='source:crawl-async': print(json.dumps(enqueue_job(args.id,'crawl',args.dry_run,5,None,args.idempotency_key),indent=2))
+    elif args.cmd=='scheduler:run-once': print(json.dumps(scheduler_run_once(),indent=2))
     elif args.cmd=='source:add': print('added', repo.add_source(vars(args)))
     elif args.cmd=='source:list': print(json.dumps([{"id":r[0],"entity_type":r[1],"entity_name":r[2],"official_url":r[3],"trust_tier":r[4],"is_active":r[5]} for r in repo.list_sources()],indent=2))
     elif args.cmd=='source:preview': s=repo.get_source(args.id); plan=discover(s[3],_cfg(),repo); print(json.dumps({"source_id":args.id,"estimated_page_count":len(plan),"urls":plan,"quality_report":{"pages_discovered":len(plan)}},indent=2))
@@ -224,5 +566,17 @@ def main():
     elif args.cmd=='export:validate': print(json.dumps(export_validate(args.id),indent=2))
     elif args.cmd=='readiness:check': print(json.dumps(readiness_check(),indent=2))
     elif args.cmd=='audit:export': print(json.dumps(audit_export(),indent=2))
+    elif args.cmd=='review:list': print(json.dumps(review_list(),indent=2))
+    elif args.cmd=='review:show': print(json.dumps(review_show(args.id),indent=2))
+    elif args.cmd=='review:approve': print(json.dumps(review_decide(args.id,'approved',args.reviewed_by),indent=2))
+    elif args.cmd=='review:reject': print(json.dumps(review_decide(args.id,'rejected',args.reviewed_by,args.notes),indent=2))
+    elif args.cmd=='publish:entity': print(json.dumps(publish_entity(args.id,args.idempotency_key),indent=2))
+    elif args.cmd=='publish:list': print(json.dumps(publish_list(),indent=2))
+    elif args.cmd=='chatbot:sync': print(json.dumps(chatbot_sync(args.entity_id,args.idempotency_key),indent=2))
+    elif args.cmd=='record:list': print(json.dumps(record_list(args.state),indent=2))
+    elif args.cmd=='record:show': print(json.dumps(record_show(args.id),indent=2))
+    elif args.cmd=='record:approve': print(json.dumps(record_approve(args.id,args.reviewed_by,args.force),indent=2))
+    elif args.cmd=='record:reject': print(json.dumps(record_reject(args.id,args.reviewed_by,args.notes),indent=2))
+    elif args.cmd=='review:seed': print(json.dumps(review_seed(args.entity_id),indent=2))
 
 if __name__=='__main__': main()

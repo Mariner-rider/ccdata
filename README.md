@@ -127,3 +127,28 @@ Safe limits via env: CRAWL_MAX_PAGES_PER_SOURCE, CRAWL_MAX_DEPTH, CRAWL_RATE_LIM
 - Validate export: `python -m services.lite_pipeline.main export:validate --id 1`.
 - Readiness: `python -m services.lite_pipeline.main readiness:check`.
 - Audit export: `python -m services.lite_pipeline.main audit:export --format json`.
+
+## Phase 10 tuning notes
+For Indian college domains, crawler now prioritizes programmes/academics/departments/fee-structure/career-development/campus-life/people/directory paths.
+
+## Phase 11 admin review
+Use `review:list`, `review:approve/reject`, `publish:entity`, and `chatbot:sync`.
+Records are not auto-published; review is mandatory.
+
+## Phase 13 migrations and API auth
+Run `python -m services.lite_pipeline.main db:migrate` and `db:status` before local-lite startup.
+Set `ADMIN_API_KEY` to protect write endpoints; pass `X-API-Key` header.
+Idempotency: pass `Idempotency-Key` header for publish/sync.
+
+## Phase 14 async crawling
+- API `POST /sources/{id}/crawl` enqueues crawl job and returns `job_id`.
+- Poll job via `GET /jobs/{id}`.
+- Worker commands: `worker:once`, `worker:run`, `jobs:list`, `jobs:show`, `jobs:cancel`.
+- Scheduler: `scheduler:run-once` enqueues refresh jobs for active sources.
+
+## Phase 15 scheduling policy
+- Due-date enqueue rule: active + never-crawled or older than crawl_frequency_days.
+- Budgets: `DAILY_MAX_JOBS`, `DAILY_MAX_JOBS_PER_DOMAIN`.
+- Failure controls: `MAX_FAILED_JOBS_PER_SOURCE`, `CRAWL_COOLDOWN_HOURS_AFTER_FAILURE`.
+- Retry policy: exponential backoff with `retry_count` and `next_retry_at`.
+- Stale running recovery: `JOB_STALE_MINUTES`.

@@ -55,3 +55,13 @@ python -m services.lite_pipeline.main storage:cleanup
 ## No-Docker alternative
 For environments without Docker/Postgres/Redis, use `RUNTIME_PROFILE=no-docker` and SQLite (`DATABASE_URL=sqlite:///./collegecue_local.db`).
 Use `make validate-no-docker` for full offline validation.
+
+## Local-lite PostgreSQL path
+Set `DATABASE_URL=postgresql://...` and run `db:migrate`.
+If psycopg is missing, commands fail with a clear guard message.
+
+## Async worker flow
+Use `source:crawl-async --id <id>`, then run `worker:once` and inspect with `jobs:show --id <job_id>`.
+
+## Scheduler report
+`scheduler:run-once` reports sources_checked, jobs_enqueued, skipped_not_due, skipped_budget, skipped_cooldown, failed_sources_blocked.

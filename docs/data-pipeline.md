@@ -26,3 +26,22 @@ Pilot/preview/dry-run return quality_report for readiness checks.
 
 ## Phase 9 validation & operations
 Use export validation to enforce clean outputs and readiness/audit commands for operational checks.
+
+## Phase 10 real-site pilot lessons
+- Prioritize Indian institutional URL patterns: programmes/program, academics, departments, fee-structure, admissions, placements/career-development, campus-life/hostel, faculty/people, contact/directory.
+- Robots/compliance logs should be reviewed alongside missing fields before save.
+- Use pilot dry-run iteratively to reduce missing fields before enabling save.
+
+## Phase 11 lifecycle
+Crawled records enter draft/needs_review and require approval before publish/chatbot sync.
+
+## Phase 13
+- Migration commands: `db:migrate`, `db:status`
+- Write API key via `ADMIN_API_KEY`
+- Publish/sync idempotency keys supported
+
+## Queue and scheduler
+Job lifecycle: queued -> running -> completed/failed/cancelled via `crawl_jobs` table. Memory queue for no-docker, Redis optional.
+
+## Phase 15
+Scheduler enforces due-date + budgets + cooldown and worker retries failed jobs with backoff; stale running jobs are recovered.

@@ -36,3 +36,6 @@ Set `CRAWL_ALLOWED_DOMAINS` to restrict crawl scope.
 - `export:validate` for heading/empty/duplicate checks
 - `readiness:check` for runtime readiness
 - `audit:export` for compliance logs
+
+## Admin review and publishing
+See `docs/admin-review-workflow.md`. API endpoints mirror CLI review/publish/sync flow.

@@ -1,0 +1,14 @@
+{
+  "safe_completed": true,
+  "quality_report": {
+    "pages_discovered": 5,
+    "pages_crawled": 3,
+    "missing_fields": ["fees", "hostel", "placement"],
+    "confidence_score": 0.72
+  },
+  "compliance_log": [
+    {"source_url":"https://www.example.edu/admissions","status":"ok","detail":"200"},
+    {"source_url":"https://www.example.edu/programmes","status":"ok","detail":"200"},
+    {"source_url":"https://www.example.edu/campus-life","status":"blocked","detail":"robots"}
+  ]
+}
