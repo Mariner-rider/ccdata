@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from urllib import robotparser
 from services.extraction.webclaw_adapter.fallback_extractor import extract_fallback
+from services.institutions.crawler import crawl_institution_sync, read_bulk_csv
 try:
     import psycopg
 except Exception:
@@ -261,7 +262,8 @@ def _fetch_extract_resilient(url, timeout=15):
 
 def _canonical_sig(rec):
     nm=(rec.get('fields',{}).get('name') or rec.get('title') or '').strip().lower()
-    loc=(rec.get('fields',{}).get('location') or '').strip().lower()
+    loc_val=rec.get('fields',{}).get('location') or ''
+    loc=(json.dumps(loc_val,sort_keys=True) if isinstance(loc_val,dict) else str(loc_val)).strip().lower()
     dom=urlparse(rec.get('official_url') or rec.get('source_url') or '').netloc.lower()
     return hashlib.sha1(f'{nm}|{loc}|{dom}'.encode()).hexdigest()
 
@@ -340,6 +342,39 @@ def crawl_source(id,dry=False):
         with sqlite3.connect(repo.path) as c:
             c.execute('UPDATE source_registry SET last_crawled_at=?,updated_at=? WHERE id=?',(datetime.now(timezone.utc).isoformat(),datetime.now(timezone.utc).isoformat(),sid)); c.commit()
     return {"source_id":sid,"status":st,"quality_report":qr}
+
+
+
+def institution_crawl(url, entity_type, dry=False):
+    cfg=_cfg(); repo=Repo(cfg.database_url); repo.init()
+    result=crawl_institution_sync(url, entity_type)
+    if result.record is None:
+        if not dry:
+            repo.save_quarantine(url,{"url":url,"entity_type":entity_type,"pages_crawled":result.pages_crawled},result.reason)
+        return {"status":"quarantined","reason":result.reason,"pages_crawled":result.pages_crawled}
+    rec=result.record
+    rec['canonical_entity_id']=_canonical_sig(rec)
+    if dry:
+        return {"dry_run":True,"status":result.status,"record":rec,"pages_crawled":result.pages_crawled,"raw_html_keys":result.raw_html_keys}
+    status=repo.save_entity(rec)
+    return {"status":status,"pages_crawled":result.pages_crawled,"raw_html_keys":result.raw_html_keys,"title":rec.get('title'),"entity_type":rec.get('entity_type')}
+
+def institution_crawl_bulk(file_path, dry=False):
+    rows=read_bulk_csv(file_path); results=[]
+    for row in rows:
+        results.append({"url":row['url'],"entity_type":row['entity_type'],"result":institution_crawl(row['url'],row['entity_type'],dry=dry)})
+    return {"count":len(results),"results":results}
+
+def institution_refresh(source_id, dry=False):
+    repo=Repo(_cfg().database_url); repo.init(); src=repo.get_source(source_id)
+    if not src: return {"status":"not_found","source_id":source_id}
+    sid,etype,name,url,trust=src
+    res=institution_crawl(url,etype,dry=dry)
+    if res.get('status') in {'created','updated','unchanged'} and not dry:
+        with sqlite3.connect(repo.path) as c:
+            c.execute('UPDATE source_registry SET last_crawled_at=?,updated_at=? WHERE id=?',(datetime.now(timezone.utc).isoformat(),datetime.now(timezone.utc).isoformat(),sid)); c.commit()
+    res['source_id']=sid
+    return res
 
 def export_entity(eid): repo=Repo(_cfg().database_url); repo.init(); return repo.get_entity(eid)
 
@@ -804,6 +839,9 @@ def main():
     rap=sub.add_parser('record:approve'); rap.add_argument('--id',type=int,required=True); rap.add_argument('--reviewed-by',required=True); rap.add_argument('--force',action='store_true')
     rrj=sub.add_parser('record:reject'); rrj.add_argument('--id',type=int,required=True); rrj.add_argument('--reviewed-by',required=True); rrj.add_argument('--notes',default='')
     rsd=sub.add_parser('review:seed'); rsd.add_argument('--entity-id',type=int,required=True)
+    ic=sub.add_parser('institution:crawl'); ic.add_argument('--url',required=True); ic.add_argument('--type',dest='entity_type',required=True); ic.add_argument('--dry-run',action='store_true')
+    ib=sub.add_parser('institution:crawl-bulk'); ib.add_argument('--file',required=True); ib.add_argument('--dry-run',action='store_true')
+    irf=sub.add_parser('institution:refresh'); irf.add_argument('--id',type=int,required=True); irf.add_argument('--dry-run',action='store_true')
     args=pa.parse_args(); repo=Repo(_cfg().database_url); repo.init()
     if args.cmd=='init-db': print('initialized')
     elif args.cmd=='db:migrate': print(json.dumps(db_migrate(),indent=2))
@@ -855,5 +893,8 @@ def main():
     elif args.cmd=='record:approve': print(json.dumps(record_approve(args.id,args.reviewed_by,args.force),indent=2))
     elif args.cmd=='record:reject': print(json.dumps(record_reject(args.id,args.reviewed_by,args.notes),indent=2))
     elif args.cmd=='review:seed': print(json.dumps(review_seed(args.entity_id),indent=2))
+    elif args.cmd=='institution:crawl': print(json.dumps(institution_crawl(args.url,args.entity_type,args.dry_run),indent=2))
+    elif args.cmd=='institution:crawl-bulk': print(json.dumps(institution_crawl_bulk(args.file,args.dry_run),indent=2))
+    elif args.cmd=='institution:refresh': print(json.dumps(institution_refresh(args.id,args.dry_run),indent=2))
 
 if __name__=='__main__': main()
