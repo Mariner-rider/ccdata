@@ -7,6 +7,10 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from urllib import robotparser
 from services.extraction.webclaw_adapter.fallback_extractor import extract_fallback
+from services.institutions.crawler import crawl_institution_sync, read_bulk_csv
+from services.admissions.crawler import AdmissionsRepository, SQLITE_CREATE_ADMISSIONS, crawl_admissions_sync
+from services.jobs.crawler import JobsRepository, SQLITE_CREATE_JOBS, crawl_jobs_sync
+from services.news.crawler import NewsRepository, SQLITE_CREATE_INSTITUTIONS, SQLITE_CREATE_NEWS, crawl_news_sync
 try:
     import psycopg
 except Exception:
@@ -74,6 +78,9 @@ MIGRATIONS=[
 "CREATE TABLE IF NOT EXISTS review_queue(id SERIAL PRIMARY KEY,entity_record_id INTEGER,entity_type TEXT,title TEXT,confidence_score REAL,missing_fields TEXT,quality_gate_status TEXT,suggested_action TEXT,created_at TEXT,reviewed_at TEXT,reviewed_by TEXT,decision TEXT,notes TEXT)",
 "CREATE TABLE IF NOT EXISTS published_records(id SERIAL PRIMARY KEY,entity_record_id INTEGER,version INTEGER,payload TEXT,published_at TEXT,idempotency_key TEXT)",
 "CREATE TABLE IF NOT EXISTS chatbot_sync_logs(id SERIAL PRIMARY KEY,entity_record_id INTEGER,title TEXT,published_version INTEGER,fields_synced TEXT,status TEXT,created_at TEXT,idempotency_key TEXT)",
+"CREATE TABLE IF NOT EXISTS admissions(id SERIAL PRIMARY KEY,entity_id INTEGER,entity_name TEXT NOT NULL,admission_type TEXT NOT NULL,program_name TEXT NOT NULL,intake_year INTEGER NOT NULL,application_start_date TEXT,application_end_date TEXT,exam_date TEXT,result_date TEXT,application_link TEXT NOT NULL,eligibility_text TEXT,fee_inr INTEGER,mode TEXT,status TEXT,country TEXT,state TEXT,source_url TEXT,source_name TEXT,raw_payload TEXT,created_at TEXT,updated_at TEXT)",
+"CREATE TABLE IF NOT EXISTS jobs(id SERIAL PRIMARY KEY,title TEXT NOT NULL,organization TEXT NOT NULL,job_type TEXT NOT NULL,category TEXT NOT NULL,vacancies INTEGER,eligibility_text TEXT,age_limit TEXT,pay_scale TEXT,location TEXT,application_start_date TEXT,application_end_date TEXT,application_link TEXT NOT NULL,official_notification_pdf_url TEXT,exam_date TEXT,result_date TEXT,source_site TEXT,country TEXT,state TEXT,status TEXT,requires_login INTEGER DEFAULT 0,raw_payload TEXT,created_at TEXT,updated_at TEXT)",
+"CREATE TABLE IF NOT EXISTS news_articles(id SERIAL PRIMARY KEY,title TEXT NOT NULL,summary TEXT NOT NULL,content_url TEXT NOT NULL UNIQUE,source_name TEXT NOT NULL,category TEXT NOT NULL,tags TEXT,published_at TEXT,scraped_at TEXT,related_entity_ids TEXT,image_url TEXT,is_featured INTEGER DEFAULT 0,raw_payload TEXT,created_at TEXT)",
 ]
 
 def db_migrate():
@@ -115,6 +122,16 @@ class Repo:
             c.execute("CREATE TABLE IF NOT EXISTS public_entities(id INTEGER PRIMARY KEY,entity_record_id INTEGER UNIQUE,source_id INTEGER,entity_type TEXT,title TEXT,slug TEXT UNIQUE,location TEXT,country TEXT,summary TEXT,page_json TEXT,search_text TEXT,confidence_score REAL,lifecycle_state TEXT,published_version INTEGER,canonical_entity_id TEXT,created_at TEXT,updated_at TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY,entity_record_id INTEGER,action TEXT,notes TEXT,reviewed_by TEXT,created_at TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS crawl_jobs(id INTEGER PRIMARY KEY,source_id INTEGER,job_type TEXT,status TEXT,dry_run INTEGER,priority INTEGER,payload_json TEXT,result_json TEXT,error_message TEXT,idempotency_key TEXT,created_at TEXT,started_at TEXT,completed_at TEXT,retry_count INTEGER DEFAULT 0,next_retry_at TEXT,last_error TEXT)")
+            c.execute(SQLITE_CREATE_ADMISSIONS)
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_admissions_entity_program_year ON admissions(entity_id, program_name, intake_year)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_admissions_status_state_type ON admissions(status, state, admission_type)")
+            c.execute(SQLITE_CREATE_JOBS)
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_jobs_title_org_end ON jobs(title, organization, application_end_date)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_type_category_state_status ON jobs(job_type, category, state, status)")
+            c.execute(SQLITE_CREATE_INSTITUTIONS)
+            c.execute(SQLITE_CREATE_NEWS)
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_news_title_source_published ON news_articles(title, source_name, published_at)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_news_category_published ON news_articles(category, published_at)")
 
             try: c.execute('ALTER TABLE published_records ADD COLUMN idempotency_key TEXT')
             except Exception: pass
@@ -261,7 +278,8 @@ def _fetch_extract_resilient(url, timeout=15):
 
 def _canonical_sig(rec):
     nm=(rec.get('fields',{}).get('name') or rec.get('title') or '').strip().lower()
-    loc=(rec.get('fields',{}).get('location') or '').strip().lower()
+    loc_val=rec.get('fields',{}).get('location') or ''
+    loc=(json.dumps(loc_val,sort_keys=True) if isinstance(loc_val,dict) else str(loc_val)).strip().lower()
     dom=urlparse(rec.get('official_url') or rec.get('source_url') or '').netloc.lower()
     return hashlib.sha1(f'{nm}|{loc}|{dom}'.encode()).hexdigest()
 
@@ -340,6 +358,86 @@ def crawl_source(id,dry=False):
         with sqlite3.connect(repo.path) as c:
             c.execute('UPDATE source_registry SET last_crawled_at=?,updated_at=? WHERE id=?',(datetime.now(timezone.utc).isoformat(),datetime.now(timezone.utc).isoformat(),sid)); c.commit()
     return {"source_id":sid,"status":st,"quality_report":qr}
+
+
+
+
+
+
+def news_articles_list(category=None,days=None,entity_id=None,limit=100):
+    return NewsRepository(_cfg().database_url).list(category=category,days=days,entity_id=entity_id,limit=limit)
+
+def news_articles_featured(limit=100):
+    return NewsRepository(_cfg().database_url).list(featured=True,limit=limit)
+
+def news_articles_get(article_id):
+    return NewsRepository(_cfg().database_url).get(article_id)
+
+def news_articles_crawl(source_url=None):
+    sources=[source_url] if source_url else None
+    return crawl_news_sync(_cfg().database_url, sources=sources)
+
+def job_postings_list(job_type=None,category=None,state=None,status=None,location=None,stipend_min=None,limit=100):
+    return JobsRepository(_cfg().database_url).list(job_type=job_type,category=category,state=state,status=status,location=location,stipend_min=stipend_min,limit=limit)
+
+def job_postings_get(job_id):
+    return JobsRepository(_cfg().database_url).get(job_id)
+
+def job_postings_search(query,limit=100):
+    return JobsRepository(_cfg().database_url).search(query,limit=limit)
+
+def job_postings_mark_closed():
+    return {"closed":JobsRepository(_cfg().database_url).mark_closed()}
+
+def job_postings_crawl(job_type='private',query=None,seed_url=None):
+    seeds=[seed_url] if seed_url else []
+    return crawl_jobs_sync(_cfg().database_url, seed_urls=seeds, job_type=job_type, query=query)
+
+def admissions_list(status=None,state=None,admission_type=None,country=None,limit=100):
+    return AdmissionsRepository(_cfg().database_url).list(status=status,state=state,admission_type=admission_type,country=country,limit=limit)
+
+def admissions_get(admission_id):
+    return AdmissionsRepository(_cfg().database_url).get(admission_id)
+
+def admissions_upcoming(days=30):
+    return AdmissionsRepository(_cfg().database_url).upcoming(days)
+
+def admissions_mark_closed():
+    return {"closed":AdmissionsRepository(_cfg().database_url).mark_closed()}
+
+def admissions_crawl(entity_name, source_url=None, entity_id=None, intake_year=None):
+    return crawl_admissions_sync(_cfg().database_url, entity_id=entity_id, entity_name=entity_name, source_url=source_url, intake_year=intake_year)
+
+def institution_crawl(url, entity_type, dry=False):
+    cfg=_cfg(); repo=Repo(cfg.database_url); repo.init()
+    result=crawl_institution_sync(url, entity_type)
+    if result.record is None:
+        if not dry:
+            repo.save_quarantine(url,{"url":url,"entity_type":entity_type,"pages_crawled":result.pages_crawled},result.reason)
+        return {"status":"quarantined","reason":result.reason,"pages_crawled":result.pages_crawled}
+    rec=result.record
+    rec['canonical_entity_id']=_canonical_sig(rec)
+    if dry:
+        return {"dry_run":True,"status":result.status,"record":rec,"pages_crawled":result.pages_crawled,"raw_html_keys":result.raw_html_keys}
+    status=repo.save_entity(rec)
+    return {"status":status,"pages_crawled":result.pages_crawled,"raw_html_keys":result.raw_html_keys,"title":rec.get('title'),"entity_type":rec.get('entity_type')}
+
+def institution_crawl_bulk(file_path, dry=False):
+    rows=read_bulk_csv(file_path); results=[]
+    for row in rows:
+        results.append({"url":row['url'],"entity_type":row['entity_type'],"result":institution_crawl(row['url'],row['entity_type'],dry=dry)})
+    return {"count":len(results),"results":results}
+
+def institution_refresh(source_id, dry=False):
+    repo=Repo(_cfg().database_url); repo.init(); src=repo.get_source(source_id)
+    if not src: return {"status":"not_found","source_id":source_id}
+    sid,etype,name,url,trust=src
+    res=institution_crawl(url,etype,dry=dry)
+    if res.get('status') in {'created','updated','unchanged'} and not dry:
+        with sqlite3.connect(repo.path) as c:
+            c.execute('UPDATE source_registry SET last_crawled_at=?,updated_at=? WHERE id=?',(datetime.now(timezone.utc).isoformat(),datetime.now(timezone.utc).isoformat(),sid)); c.commit()
+    res['source_id']=sid
+    return res
 
 def export_entity(eid): repo=Repo(_cfg().database_url); repo.init(); return repo.get_entity(eid)
 
@@ -804,6 +902,21 @@ def main():
     rap=sub.add_parser('record:approve'); rap.add_argument('--id',type=int,required=True); rap.add_argument('--reviewed-by',required=True); rap.add_argument('--force',action='store_true')
     rrj=sub.add_parser('record:reject'); rrj.add_argument('--id',type=int,required=True); rrj.add_argument('--reviewed-by',required=True); rrj.add_argument('--notes',default='')
     rsd=sub.add_parser('review:seed'); rsd.add_argument('--entity-id',type=int,required=True)
+    ic=sub.add_parser('institution:crawl'); ic.add_argument('--url',required=True); ic.add_argument('--type',dest='entity_type',required=True); ic.add_argument('--dry-run',action='store_true')
+    ib=sub.add_parser('institution:crawl-bulk'); ib.add_argument('--file',required=True); ib.add_argument('--dry-run',action='store_true')
+    irf=sub.add_parser('institution:refresh'); irf.add_argument('--id',type=int,required=True); irf.add_argument('--dry-run',action='store_true')
+    acl=sub.add_parser('admissions:list'); acl.add_argument('--status',default=None); acl.add_argument('--state',default=None); acl.add_argument('--type',dest='admission_type',default=None); acl.add_argument('--country',default=None); acl.add_argument('--limit',type=int,default=100)
+    acg=sub.add_parser('admissions:get'); acg.add_argument('--id',type=int,required=True)
+    acu=sub.add_parser('admissions:upcoming'); acu.add_argument('--days',type=int,default=30)
+    acc=sub.add_parser('admissions:crawl'); acc.add_argument('--entity-name',required=True); acc.add_argument('--source-url',default=None); acc.add_argument('--entity-id',type=int,default=None); acc.add_argument('--intake-year',type=int,default=None)
+    jpl=sub.add_parser('job-postings:list'); jpl.add_argument('--type',dest='job_type',default=None); jpl.add_argument('--category',default=None); jpl.add_argument('--state',default=None); jpl.add_argument('--status',default=None); jpl.add_argument('--location',default=None); jpl.add_argument('--stipend-min',type=int,default=None); jpl.add_argument('--limit',type=int,default=100)
+    jpg=sub.add_parser('job-postings:get'); jpg.add_argument('--id',type=int,required=True)
+    jps=sub.add_parser('job-postings:search'); jps.add_argument('--q',required=True); jps.add_argument('--limit',type=int,default=100)
+    jpc=sub.add_parser('job-postings:crawl'); jpc.add_argument('--type',dest='job_type',default='private'); jpc.add_argument('--query',default=None); jpc.add_argument('--seed-url',default=None)
+    nwl=sub.add_parser('news:list'); nwl.add_argument('--category',default=None); nwl.add_argument('--days',type=int,default=None); nwl.add_argument('--entity-id',type=int,default=None); nwl.add_argument('--limit',type=int,default=100)
+    nwg=sub.add_parser('news:get'); nwg.add_argument('--id',type=int,required=True)
+    sub.add_parser('news:featured')
+    nwc=sub.add_parser('news:crawl'); nwc.add_argument('--source-url',default=None)
     args=pa.parse_args(); repo=Repo(_cfg().database_url); repo.init()
     if args.cmd=='init-db': print('initialized')
     elif args.cmd=='db:migrate': print(json.dumps(db_migrate(),indent=2))
@@ -855,5 +968,20 @@ def main():
     elif args.cmd=='record:approve': print(json.dumps(record_approve(args.id,args.reviewed_by,args.force),indent=2))
     elif args.cmd=='record:reject': print(json.dumps(record_reject(args.id,args.reviewed_by,args.notes),indent=2))
     elif args.cmd=='review:seed': print(json.dumps(review_seed(args.entity_id),indent=2))
+    elif args.cmd=='institution:crawl': print(json.dumps(institution_crawl(args.url,args.entity_type,args.dry_run),indent=2))
+    elif args.cmd=='institution:crawl-bulk': print(json.dumps(institution_crawl_bulk(args.file,args.dry_run),indent=2))
+    elif args.cmd=='institution:refresh': print(json.dumps(institution_refresh(args.id,args.dry_run),indent=2))
+    elif args.cmd=='admissions:list': print(json.dumps(admissions_list(args.status,args.state,args.admission_type,args.country,args.limit),indent=2))
+    elif args.cmd=='admissions:get': print(json.dumps(admissions_get(args.id),indent=2))
+    elif args.cmd=='admissions:upcoming': print(json.dumps(admissions_upcoming(args.days),indent=2))
+    elif args.cmd=='admissions:crawl': print(json.dumps(admissions_crawl(args.entity_name,args.source_url,args.entity_id,args.intake_year),indent=2))
+    elif args.cmd=='job-postings:list': print(json.dumps(job_postings_list(args.job_type,args.category,args.state,args.status,args.location,args.stipend_min,args.limit),indent=2))
+    elif args.cmd=='job-postings:get': print(json.dumps(job_postings_get(args.id),indent=2))
+    elif args.cmd=='job-postings:search': print(json.dumps(job_postings_search(args.q,args.limit),indent=2))
+    elif args.cmd=='job-postings:crawl': print(json.dumps(job_postings_crawl(args.job_type,args.query,args.seed_url),indent=2))
+    elif args.cmd=='news:list': print(json.dumps(news_articles_list(args.category,args.days,args.entity_id,args.limit),indent=2))
+    elif args.cmd=='news:get': print(json.dumps(news_articles_get(args.id),indent=2))
+    elif args.cmd=='news:featured': print(json.dumps(news_articles_featured(),indent=2))
+    elif args.cmd=='news:crawl': print(json.dumps(news_articles_crawl(args.source_url),indent=2))
 
 if __name__=='__main__': main()

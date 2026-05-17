@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 import os
-from services.lite_pipeline.main import Repo,_cfg,discover,crawl_source,export_entity,review_list,review_decide,publish_entity,chatbot_sync,record_approve,enqueue_job,job_get,metrics_summary,sources_freshness,jobs_failures,quality_report_summary,_search,public_entities_list,public_entity_get
+from services.lite_pipeline.main import Repo,_cfg,discover,crawl_source,export_entity,review_list,review_decide,publish_entity,chatbot_sync,record_approve,enqueue_job,job_get,metrics_summary,sources_freshness,jobs_failures,quality_report_summary,_search,public_entities_list,public_entity_get,admissions_list,admissions_get,admissions_upcoming,job_postings_list,job_postings_get,job_postings_search,news_articles_list,news_articles_featured,news_articles_get
 
 app=FastAPI(title='collegecue-local-lite')
 ADMIN_API_KEY=os.getenv('ADMIN_API_KEY','')
@@ -56,7 +56,7 @@ def approve_record(id:int,reviewed_by:str='admin', x_api_key:str|None=Header(def
     _guard(x_api_key); return record_approve(id,reviewed_by)
 
 
-@app.get('/jobs/{id}')
+@app.get('/crawl-jobs/{id}')
 def job(id:int):
     return job_get(id)
 
@@ -84,5 +84,54 @@ def public_entities(entity_type:str|None=None, country:str|None=None, location:s
 @app.get('/public/entities/{slug}')
 def public_entity(slug:str):
     out=public_entity_get(slug)
+    if not out: raise HTTPException(status_code=404,detail='not found')
+    return out
+
+
+@app.get('/admissions')
+def list_admissions(status:str|None=None,state:str|None=None,type:str|None=None,country:str|None=None,limit:int=100):
+    return {"results":admissions_list(status=status,state=state,admission_type=type,country=country,limit=limit)}
+
+@app.get('/admissions/upcoming')
+def upcoming_admissions(days:int=30):
+    return {"results":admissions_upcoming(days)}
+
+@app.get('/admissions/{id}')
+def admission_detail(id:int):
+    out=admissions_get(id)
+    if not out: raise HTTPException(status_code=404,detail='not found')
+    return out
+
+
+@app.get('/jobs/search')
+def search_jobs(q:str,limit:int=100):
+    return {"results":job_postings_search(q,limit)}
+
+@app.get('/jobs/internships')
+def internships(stipend_min:int|None=None,location:str|None=None,status:str|None=None,limit:int=100):
+    return {"results":job_postings_list(job_type='internship',location=location,stipend_min=stipend_min,status=status,limit=limit)}
+
+@app.get('/jobs')
+def list_job_postings(type:str|None=None,category:str|None=None,state:str|None=None,status:str|None=None,location:str|None=None,limit:int=100):
+    return {"results":job_postings_list(job_type=type,category=category,state=state,status=status,location=location,limit=limit)}
+
+@app.get('/jobs/{id}')
+def job_posting_detail(id:int):
+    out=job_postings_get(id)
+    if not out: raise HTTPException(status_code=404,detail='not found')
+    return out
+
+
+@app.get('/news/featured')
+def featured_news(limit:int=100):
+    return {"results":news_articles_featured(limit)}
+
+@app.get('/news')
+def list_news(category:str|None=None,days:int|None=None,entity_id:int|None=None,limit:int=100):
+    return {"results":news_articles_list(category=category,days=days,entity_id=entity_id,limit=limit)}
+
+@app.get('/news/{id}')
+def news_detail(id:int):
+    out=news_articles_get(id)
     if not out: raise HTTPException(status_code=404,detail='not found')
     return out
