@@ -11,6 +11,7 @@ from services.institutions.crawler import crawl_institution_sync, read_bulk_csv
 from services.admissions.crawler import AdmissionsRepository, SQLITE_CREATE_ADMISSIONS, crawl_admissions_sync
 from services.jobs.crawler import JobsRepository, SQLITE_CREATE_JOBS, crawl_jobs_sync
 from services.news.crawler import NewsRepository, SQLITE_CREATE_INSTITUTIONS, SQLITE_CREATE_NEWS, crawl_news_sync
+from services.research.crawler import ResearchRepository, SQLITE_CREATE_RESEARCH, crawl_research_sync
 try:
     import psycopg
 except Exception:
@@ -81,6 +82,7 @@ MIGRATIONS=[
 "CREATE TABLE IF NOT EXISTS admissions(id SERIAL PRIMARY KEY,entity_id INTEGER,entity_name TEXT NOT NULL,admission_type TEXT NOT NULL,program_name TEXT NOT NULL,intake_year INTEGER NOT NULL,application_start_date TEXT,application_end_date TEXT,exam_date TEXT,result_date TEXT,application_link TEXT NOT NULL,eligibility_text TEXT,fee_inr INTEGER,mode TEXT,status TEXT,country TEXT,state TEXT,source_url TEXT,source_name TEXT,raw_payload TEXT,created_at TEXT,updated_at TEXT)",
 "CREATE TABLE IF NOT EXISTS jobs(id SERIAL PRIMARY KEY,title TEXT NOT NULL,organization TEXT NOT NULL,job_type TEXT NOT NULL,category TEXT NOT NULL,vacancies INTEGER,eligibility_text TEXT,age_limit TEXT,pay_scale TEXT,location TEXT,application_start_date TEXT,application_end_date TEXT,application_link TEXT NOT NULL,official_notification_pdf_url TEXT,exam_date TEXT,result_date TEXT,source_site TEXT,country TEXT,state TEXT,status TEXT,requires_login INTEGER DEFAULT 0,raw_payload TEXT,created_at TEXT,updated_at TEXT)",
 "CREATE TABLE IF NOT EXISTS news_articles(id SERIAL PRIMARY KEY,title TEXT NOT NULL,summary TEXT NOT NULL,content_url TEXT NOT NULL UNIQUE,source_name TEXT NOT NULL,category TEXT NOT NULL,tags TEXT,published_at TEXT,scraped_at TEXT,related_entity_ids TEXT,image_url TEXT,is_featured INTEGER DEFAULT 0,raw_payload TEXT,created_at TEXT)",
+"CREATE TABLE IF NOT EXISTS research_items(id SERIAL PRIMARY KEY,title TEXT NOT NULL,authors TEXT NOT NULL,abstract TEXT,type TEXT NOT NULL,field TEXT NOT NULL,subfield TEXT,keywords TEXT,institution_id INTEGER,institution_name TEXT,published_date TEXT,doi TEXT,arxiv_id TEXT,pdf_url TEXT,source_url TEXT,citation_count INTEGER,status TEXT,title_author_hash TEXT NOT NULL,raw_payload TEXT,created_at TEXT,updated_at TEXT)",
 ]
 
 def db_migrate():
@@ -132,6 +134,9 @@ class Repo:
             c.execute(SQLITE_CREATE_NEWS)
             c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_news_title_source_published ON news_articles(title, source_name, published_at)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_news_category_published ON news_articles(category, published_at)")
+            c.execute(SQLITE_CREATE_RESEARCH)
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_research_title_author_hash ON research_items(title_author_hash)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_research_field_type_year ON research_items(field, type, published_date)")
 
             try: c.execute('ALTER TABLE published_records ADD COLUMN idempotency_key TEXT')
             except Exception: pass
@@ -363,6 +368,21 @@ def crawl_source(id,dry=False):
 
 
 
+
+
+def research_items_list(field=None,item_type=None,year=None,institution_id=None,limit=100):
+    return ResearchRepository(_cfg().database_url).list(field=field,item_type=item_type,year=year,institution_id=institution_id,limit=limit)
+
+def research_items_get(item_id):
+    return ResearchRepository(_cfg().database_url).get(item_id)
+
+def research_items_search(query,limit=100):
+    return ResearchRepository(_cfg().database_url).search(query,limit=limit)
+
+def research_items_crawl(query=None,seed_url=None,include_arxiv=True):
+    queries=[query] if query else None
+    seeds=[seed_url] if seed_url else []
+    return crawl_research_sync(_cfg().database_url, queries=queries, seed_urls=seeds, include_arxiv=include_arxiv)
 
 def news_articles_list(category=None,days=None,entity_id=None,limit=100):
     return NewsRepository(_cfg().database_url).list(category=category,days=days,entity_id=entity_id,limit=limit)
@@ -917,6 +937,10 @@ def main():
     nwg=sub.add_parser('news:get'); nwg.add_argument('--id',type=int,required=True)
     sub.add_parser('news:featured')
     nwc=sub.add_parser('news:crawl'); nwc.add_argument('--source-url',default=None)
+    rsl=sub.add_parser('research:list'); rsl.add_argument('--field',default=None); rsl.add_argument('--type',dest='item_type',default=None); rsl.add_argument('--year',type=int,default=None); rsl.add_argument('--institution-id',type=int,default=None); rsl.add_argument('--limit',type=int,default=100)
+    rsg=sub.add_parser('research:get'); rsg.add_argument('--id',type=int,required=True)
+    rss=sub.add_parser('research:search'); rss.add_argument('--q',required=True); rss.add_argument('--limit',type=int,default=100)
+    rsc=sub.add_parser('research:crawl'); rsc.add_argument('--query',default=None); rsc.add_argument('--seed-url',default=None); rsc.add_argument('--no-arxiv',action='store_true')
     args=pa.parse_args(); repo=Repo(_cfg().database_url); repo.init()
     if args.cmd=='init-db': print('initialized')
     elif args.cmd=='db:migrate': print(json.dumps(db_migrate(),indent=2))
@@ -983,5 +1007,9 @@ def main():
     elif args.cmd=='news:get': print(json.dumps(news_articles_get(args.id),indent=2))
     elif args.cmd=='news:featured': print(json.dumps(news_articles_featured(),indent=2))
     elif args.cmd=='news:crawl': print(json.dumps(news_articles_crawl(args.source_url),indent=2))
+    elif args.cmd=='research:list': print(json.dumps(research_items_list(args.field,args.item_type,args.year,args.institution_id,args.limit),indent=2))
+    elif args.cmd=='research:get': print(json.dumps(research_items_get(args.id),indent=2))
+    elif args.cmd=='research:search': print(json.dumps(research_items_search(args.q,args.limit),indent=2))
+    elif args.cmd=='research:crawl': print(json.dumps(research_items_crawl(args.query,args.seed_url,not args.no_arxiv),indent=2))
 
 if __name__=='__main__': main()
