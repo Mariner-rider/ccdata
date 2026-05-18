@@ -1,184 +1,211 @@
-# CollegeCue Optimized Crawler (Phase 3)
+# CollegeCue Data Crawler — VPS Production Deployment Guide
 
-## One-command validation
-```bash
-make validate-lite
-```
-This runs compile/tests, docker checks (if available), local-lite compose validation, health probes, crawl smoke commands, and size report generation.
+CollegeCue data ingestion is a DB-first crawler and publishing pipeline for institution, admission, job, news and research data.
 
-## Dependency locking
-- `pyproject.toml` with pinned runtime/dev deps and dependency groups.
-- `uv.lock` (repository lock artifact placeholder in restricted env; regenerate with `uv lock`).
-- `requirements.lock.txt` pinned export.
+The production data flow is always:
 
-Install options:
-```bash
-uv sync
-uv sync --extra dev
-# or pip fallback
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
+```text
+Crawler → crawl_records (raw) → human review → public_entities (clean) → API/frontend
 ```
 
-## Local-lite profile
+Data NEVER goes from `crawl_records` to the frontend directly. Every record must pass human review before it is published.
+
+## Repository layout
+
+- `services/lite_pipeline/main.py` — CLI entry point for migrations, crawling, review, publishing, workers and maintenance.
+- `services/lite_pipeline/api.py` — FastAPI app for health, review/admin actions and public API endpoints.
+- `services/deep_crawler/` — Crawl4AI-first deep crawler for institution websites.
+- `services/admissions/`, `services/jobs/`, `services/news/`, `services/research/`, `services/institutions/` — domain-specific crawlers and repositories.
+- `migrations/` — SQL migrations for crawler and domain tables.
+- `airflow/dags/` — scheduled monitoring and crawl DAGs.
+- `docker-compose.production.yml` — VPS production stack.
+- `.github/workflows/ci.yml.disabled` — disabled CI workflow template, ready for later activation.
+
+## Prerequisites
+
+Install these on the VPS:
+
+- Docker Engine with the Docker Compose plugin
+- GNU Make
+- Git
+- A reverse proxy or load balancer in front of `core-api` if exposing the API publicly
+
+## First-time VPS deployment
+
+1. Clone the repository:
+
 ```bash
-docker compose -f docker-compose.local-lite.yml up --build
-```
-Includes only:
-- PostgreSQL
-- Redis
-- core-api
-- worker
-
-Excludes:
-- Kafka
-- Airflow
-- Elasticsearch
-- Nutch
-- Playwright
-- Selenium
-
-## Health endpoints
-- `/health`
-- `/health/db`
-- `/health/redis`
-- `/health/webclaw`
-
-When `WEBCLAW_ENABLED=false`:
-- `health/webclaw` returns disabled
-- extraction falls back to HTTP+BS4
-
-## CLI commands
-```bash
-python -m services.lite_pipeline.main crawl:single --url https://example.com
-python -m services.lite_pipeline.main extract:test --url https://example.com
-python -m services.lite_pipeline.main crawl:missing-fields
-python -m services.lite_pipeline.main crawl:monthly-refresh
-python -m services.lite_pipeline.main storage:status
-python -m services.lite_pipeline.main storage:cleanup
-python -m services.lite_pipeline.main docker:size-report
+git clone https://github.com/Mariner-rider/ccdata.git
+cd ccdata
 ```
 
-## Make targets
-- `make install`
-- `make install-dev`
-- `make test`
-- `make lint`
-- `make compile`
-- `make docker-build-lite`
-- `make docker-up-lite`
-- `make docker-down-lite`
-- `make docker-size-report`
-- `make validate-lite`
-- `make crawl-single URL=https://example.com`
-- `make storage-cleanup`
-- `make storage-status`
+2. Create the production environment file:
 
-## Image-size hard limits
-Enforced by `scripts/docker_size_report.py`:
-- core image <= 1.5GB
-- worker image <= 1.5GB
-- browser-worker image <= 3GB
-- local-lite total <= 5GB
-
-Override guard:
 ```bash
-ALLOW_LARGE_IMAGES=true make docker-size-report
+cp .env.production.example .env
 ```
 
-## Verification artifacts
-- `docs/docker-size-report.md`
-- `docs/local-lite-verification-report.md`
+3. Generate secrets and edit `.env`:
 
-## Additional docs
-- `docs/optimization-audit.md`
-- `docs/local-lite-setup.md`
-- `docs/docker-optimization.md`
-- `docs/webclaw-integration.md`
-- `docs/data-pipeline.md`
+```bash
+openssl rand -hex 32
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
 
-## No-Docker mode
-Use offline profile with SQLite and in-memory queue.
-Run `make init-db`, `make crawl-fixture`, and `make validate-no-docker`.
-WebClaw is optional and disabled by default in this profile.
+Set at least:
 
-## Phase 5: Controlled real-site crawling
-Use source registry CLI:
-- `python -m services.lite_pipeline.main source:add --entity-type college --entity-name "IIM Bangalore" --url https://www.iimb.ac.in`
-- `python -m services.lite_pipeline.main source:list`
-- `python -m services.lite_pipeline.main source:crawl-active`
-Safe limits via env: CRAWL_MAX_PAGES_PER_SOURCE, CRAWL_MAX_DEPTH, CRAWL_RATE_LIMIT_SECONDS, CRAWL_TIMEOUT_SECONDS, CRAWL_SAME_DOMAIN_ONLY.
+- `POSTGRES_PASSWORD`
+- `MINIO_ROOT_PASSWORD`
+- `SERVICE_API_KEY`
+- `AIRFLOW_ADMIN_PASSWORD`
+- `AIRFLOW_FERNET_KEY`
+- `PUBLIC_CORS_ORIGINS`
 
-## Phase 7 robustness
-- Use `source:preview --id <id>` to inspect prioritized crawl URLs, page type, robots decision, and estimated page count.
-- Use `source:crawl --id <id> --dry-run` to fetch/merge without DB writes.
-- Multi-page crawl merges into one entity profile and removes heading-only pollution in list fields.
-- Quality gate routes low-quality records to `quarantine_records`.
-- Export page-ready JSON with `export:entity --id <id> --format json`.
+4. Validate Compose configuration:
 
-## Phase 8 pilot readiness
-- Pilot run: `python -m services.lite_pipeline.main pilot:college --name "IIM Bangalore" --url https://www.iimb.ac.in --dry-run`.
-- Add `--save` to persist merged entity.
-- Configure `CRAWL_ALLOWED_DOMAINS=example.edu,example.ac.in` for safe allowlist control.
-- Compliance logs include robots decisions, skipped URLs (binary/cross-domain/allowlist), and extraction errors.
+```bash
+docker compose -f docker-compose.production.yml config
+```
 
-## Phase 9 production hardening
-- HTTP smoke dry-run: `python -m services.lite_pipeline.main pilot:http-smoke --url https://example.edu --name "Example"`.
-- Validate export: `python -m services.lite_pipeline.main export:validate --id 1`.
-- Readiness: `python -m services.lite_pipeline.main readiness:check`.
-- Audit export: `python -m services.lite_pipeline.main audit:export --format json`.
+5. Build and start services:
 
-## Phase 10 tuning notes
-For Indian college domains, crawler now prioritizes programmes/academics/departments/fee-structure/career-development/campus-life/people/directory paths.
+```bash
+make deploy
+```
 
-## Phase 11 admin review
-Use `review:list`, `review:approve/reject`, `publish:entity`, and `chatbot:sync`.
-Records are not auto-published; review is mandatory.
+6. Check service health:
 
-## Phase 13 migrations and API auth
-Run `python -m services.lite_pipeline.main db:migrate` and `db:status` before local-lite startup.
-Set `ADMIN_API_KEY` to protect write endpoints; pass `X-API-Key` header.
-Idempotency: pass `Idempotency-Key` header for publish/sync.
+```bash
+make ps
+make logs
+```
 
-## Phase 14 async crawling
-- API `POST /sources/{id}/crawl` enqueues crawl job and returns `job_id`.
-- Poll job via `GET /jobs/{id}`.
-- Worker commands: `worker:once`, `worker:run`, `jobs:list`, `jobs:show`, `jobs:cancel`.
-- Scheduler: `scheduler:run-once` enqueues refresh jobs for active sources.
+7. Run database setup/migrations when the API image is available:
 
-## Phase 15 scheduling policy
-- Due-date enqueue rule: active + never-crawled or older than crawl_frequency_days.
-- Budgets: `DAILY_MAX_JOBS`, `DAILY_MAX_JOBS_PER_DOMAIN`.
-- Failure controls: `MAX_FAILED_JOBS_PER_SOURCE`, `CRAWL_COOLDOWN_HOURS_AFTER_FAILURE`.
-- Retry policy: exponential backoff with `retry_count` and `next_retry_at`.
-- Stale running recovery: `JOB_STALE_MINUTES`.
+```bash
+docker compose -f docker-compose.production.yml exec core-api python -m services.lite_pipeline.main db:migrate
+```
 
-## Phase 16 observability
-Commands:
-- `metrics:summary`
-- `sources:freshness`
-- `jobs:failures`
-- `quality:report`
-Use `LOG_FORMAT=json` for structured operational logs.
+## Daily operations
 
-## Phase 18 Robustness & Search
-- HTTP resilience: retries/backoff/jitter with status handling (403 blocked, 429 cooldown, 5xx retry) via `CRAWL_MAX_RETRIES`, `CRAWL_BACKOFF_BASE_SECONDS`, `CRAWL_USER_AGENTS`.
-- Optional proxy rotation via `HTTP_PROXY_LIST` with graceful fallback.
-- Cross-source dedup with `canonical_entity_id` and duplicate flagging.
-- Delta tracking through `change_log` on record updates.
-- Event-driven ingest: `source:add --trigger-crawl`.
-- Search: `search --query "MBA Bangalore"` and API `GET /search?q=...` with `entity_type`/`location` filters.
+Common Make targets:
 
-## Phase 19 Public Data Model
-- `public_entities` separates production page/search data from raw crawler records.
-- Publish flow now upserts page-ready `page_json` + `search_text` and keeps `published_records` history.
-- Slugs are stable (`title-location`) with uniqueness suffixes (`-2`, `-3`).
-- Reindex command: `python -m services.lite_pipeline.main index:rebuild`.
-- Public endpoints: `GET /public/entities`, `GET /public/entities/{slug}`, search via `GET /search?q=...` over published entities only.
+```bash
+make deploy          # build and start the production stack
+make ps              # show service status
+make logs            # follow production logs
+make restart         # rebuild/recreate production services
+make stop            # stop the production stack without deleting volumes
+make test            # run pytest locally
+make lint            # run ruff locally
+make compile         # compile lite pipeline CLI
+make storage-status  # inspect object storage usage
+make storage-cleanup # clean old raw HTML through the CLI
+```
 
-## Phase 20 Multi-category support
-Supported public entity types: college, institute, admission, job, scholarship, news, education_loan.
-Search examples:
-- `python -m services.lite_pipeline.main search --query "MBA" --entity-type admission`
-- `python -m services.lite_pipeline.main search --query "scholarship" --entity-type scholarship`
-- `python -m services.lite_pipeline.main search --query "loan" --country India`
+## Crawling workflow
+
+1. Add or identify a source in `source_registry`.
+2. Preview crawl targets before fetching:
+
+```bash
+python -m services.lite_pipeline.main source:preview --id X
+```
+
+3. Run a dry run first:
+
+```bash
+python -m services.lite_pipeline.main source:crawl --id X --dry-run
+```
+
+4. Run a persisted crawl:
+
+```bash
+python -m services.lite_pipeline.main source:crawl --id X
+```
+
+5. Use deep crawl for full institution profiles:
+
+```bash
+python -m services.lite_pipeline.main source:deep-crawl --id X
+```
+
+## Human review and publishing
+
+Raw crawl output is stored in `crawl_records`. It is not public.
+
+Review and publish flow:
+
+```bash
+python -m services.lite_pipeline.main review:list
+python -m services.lite_pipeline.main record:approve --id RECORD_ID --reviewed-by reviewer@example.com
+python -m services.lite_pipeline.main publish:entity --id RECORD_ID
+python -m services.lite_pipeline.main public:list
+```
+
+Only `public_entities` is used by `/public/*` endpoints and frontend-facing search.
+
+## API notes
+
+- Public endpoints are under `/public/*` and read from `public_entities`.
+- Admin/write endpoints should be protected with `SERVICE_API_KEY` or `ADMIN_API_KEY`.
+- CORS is controlled with `PUBLIC_CORS_ORIGINS`; do not use `*` in production.
+- `/robots.txt` is served by the API for the CollegeCue platform.
+
+## Airflow
+
+Airflow uses the same PostgreSQL service and requires a valid `AIRFLOW_FERNET_KEY`.
+
+Useful commands:
+
+```bash
+docker compose -f docker-compose.production.yml logs airflow-init
+docker compose -f docker-compose.production.yml logs airflow-scheduler
+docker compose -f docker-compose.production.yml logs airflow-webserver
+```
+
+## Troubleshooting
+
+**Port 8000 not responding:**
+Check core-api is healthy: `make ps`
+Check logs: `docker compose -f docker-compose.production.yml logs core-api`
+
+**Database connection refused:**
+Check postgres is healthy. Check POSTGRES_PASSWORD in .env matches
+what was used when postgres volume was first created. If you changed
+the password after first run, you must delete the volume and re-init:
+`docker compose -f docker-compose.production.yml down -v` (WARNING: deletes all data)
+
+**Crawl returns empty results:**
+Run source:preview --id X first. Check if robots.txt is blocking.
+Check if the site needs JavaScript — confirm Playwright is running.
+
+**Airflow not starting:**
+Verify AIRFLOW_FERNET_KEY is set in .env and is a valid Fernet key.
+Check: `docker compose -f docker-compose.production.yml logs airflow-init`
+
+**Out of disk space:**
+Clean old raw HTML: `make storage-cleanup`
+Check MinIO storage: `make storage-status`
+Check Docker images: `docker system df`
+Prune unused images: `docker image prune -f`
+
+## CI (disabled — ready to activate)
+
+A complete CI workflow is stored at:
+  .github/workflows/ci.yml.disabled
+
+To activate when you are ready:
+1. Rename the file to ci.yml
+2. Add repository secrets in GitHub:
+   Settings → Secrets → POSTGRES_PASSWORD, SERVICE_API_KEY
+3. Push — CI runs automatically on every PR
+
+---
+
+All phase notes (Phase 5, Phase 7 etc.) are intentionally
+removed — they were internal development notes, not
+operational documentation. If needed they are preserved
+in git history.
+
+End of README. Do not add any content after this line.

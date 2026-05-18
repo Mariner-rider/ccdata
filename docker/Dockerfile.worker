@@ -2,8 +2,9 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 RUN useradd -m appuser
-COPY services/requirements-worker.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY pyproject.toml README.md /app/
 COPY services /app/services
+RUN pip install --no-cache-dir -e ".[postgres,redis,crawler]"
+RUN playwright install chromium --with-deps
 USER appuser
-CMD ["python", "-m", "services.lite_pipeline.main", "crawl:missing-fields"]
+CMD ["python", "-m", "services.lite_pipeline.main", "worker:run"]

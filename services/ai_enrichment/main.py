@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import requests
+from services.common.user_agents import get_headers
 from duckduckgo_search import DDGS
 from transformers import pipeline
 
@@ -117,7 +118,7 @@ def _llm_fallback(prompt: str) -> dict[str, Any] | None:
     }
     response = requests.post(
         "https://api.openai.com/v1/responses",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers={**get_headers("https://api.openai.com/v1/responses"), "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         data=json.dumps(body),
         timeout=30,
     )

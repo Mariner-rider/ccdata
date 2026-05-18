@@ -1,6 +1,0 @@
-psycopg[binary]==3.2.3
-redis==5.2.1
-rq==1.16.2
-httpx==0.28.1
-beautifulsoup4==4.13.3
-w3lib==2.2.1

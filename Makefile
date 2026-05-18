@@ -1,17 +1,48 @@
+COMPOSE_PROD=docker compose -f docker-compose.production.yml
+COMPOSE_LITE=docker compose -f docker-compose.local-lite.yml
+PYTHON?=python
+
 install:
-	pip install -r requirements.txt
+	pip install -e .
 
 install-dev:
-	pip install -r requirements-dev.txt
+	pip install -e ".[dev,webclaw,postgres,redis]"
 
 test:
 	pytest -q
 
-validate-no-docker:
-	python scripts/validate_no_docker.py
+lint:
+	ruff check services/ tests/
 
-init-db:
-	RUNTIME_PROFILE=no-docker DATABASE_URL=sqlite:///./collegecue_local.db python -m services.lite_pipeline.main init-db
+compile:
+	$(PYTHON) -m py_compile services/lite_pipeline/main.py
 
-crawl-fixture:
-	RUNTIME_PROFILE=no-docker DATABASE_URL=sqlite:///./collegecue_local.db QUEUE_BACKEND=memory WEBCLAW_ENABLED=false python -m services.lite_pipeline.main crawl:single --url file://tests/fixtures/college_sample.html
+ps:
+	$(COMPOSE_PROD) ps
+
+logs:
+	$(COMPOSE_PROD) logs -f --tail=200
+
+restart:
+	$(COMPOSE_PROD) up -d --build
+
+stop:
+	$(COMPOSE_PROD) down
+
+deploy:
+	$(COMPOSE_PROD) up -d --build
+
+storage-status:
+	$(COMPOSE_PROD) exec minio mc du local/raw-html || true
+
+storage-cleanup:
+	$(PYTHON) -m services.lite_pipeline.main storage:cleanup || true
+
+docker-size-report:
+	$(PYTHON) scripts/docker_size_report.py
+
+local-config:
+	$(COMPOSE_LITE) config
+
+production-config:
+	$(COMPOSE_PROD) config

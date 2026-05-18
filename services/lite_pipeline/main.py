@@ -1,12 +1,19 @@
 from __future__ import annotations
-import argparse, hashlib, json, os, random, sqlite3, time
+import argparse, asyncio, hashlib, json, os, sqlite3, time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from urllib import robotparser
-from services.extraction.webclaw_adapter.fallback_extractor import extract_fallback
+from services.common.user_agents import add_jitter, get_random_ua
+from services.extraction.fallback_extractor import extract_fallback
+from services.institutions.crawler import crawl_institution_sync, read_bulk_csv
+from services.admissions.crawler import AdmissionsRepository, SQLITE_CREATE_ADMISSIONS, crawl_admissions_sync
+from services.jobs.crawler import JobsRepository, SQLITE_CREATE_JOBS, crawl_jobs_sync
+from services.news.crawler import NewsRepository, SQLITE_CREATE_INSTITUTIONS, SQLITE_CREATE_NEWS, crawl_news_sync
+from services.research.crawler import ResearchRepository, SQLITE_CREATE_RESEARCH, crawl_research_sync
+from services.deep_crawler.crawler import DeepCrawler, PRIORITY_PATHS, crawl_institution as deep_crawl_institution
 try:
     import psycopg
 except Exception:
@@ -74,6 +81,10 @@ MIGRATIONS=[
 "CREATE TABLE IF NOT EXISTS review_queue(id SERIAL PRIMARY KEY,entity_record_id INTEGER,entity_type TEXT,title TEXT,confidence_score REAL,missing_fields TEXT,quality_gate_status TEXT,suggested_action TEXT,created_at TEXT,reviewed_at TEXT,reviewed_by TEXT,decision TEXT,notes TEXT)",
 "CREATE TABLE IF NOT EXISTS published_records(id SERIAL PRIMARY KEY,entity_record_id INTEGER,version INTEGER,payload TEXT,published_at TEXT,idempotency_key TEXT)",
 "CREATE TABLE IF NOT EXISTS chatbot_sync_logs(id SERIAL PRIMARY KEY,entity_record_id INTEGER,title TEXT,published_version INTEGER,fields_synced TEXT,status TEXT,created_at TEXT,idempotency_key TEXT)",
+"CREATE TABLE IF NOT EXISTS admissions(id SERIAL PRIMARY KEY,entity_id INTEGER,entity_name TEXT NOT NULL,admission_type TEXT NOT NULL,program_name TEXT NOT NULL,intake_year INTEGER NOT NULL,application_start_date TEXT,application_end_date TEXT,exam_date TEXT,result_date TEXT,application_link TEXT NOT NULL,eligibility_text TEXT,fee_inr INTEGER,mode TEXT,status TEXT,country TEXT,state TEXT,source_url TEXT,source_name TEXT,raw_payload TEXT,created_at TEXT,updated_at TEXT)",
+"CREATE TABLE IF NOT EXISTS jobs(id SERIAL PRIMARY KEY,title TEXT NOT NULL,organization TEXT NOT NULL,job_type TEXT NOT NULL,category TEXT NOT NULL,vacancies INTEGER,eligibility_text TEXT,age_limit TEXT,pay_scale TEXT,location TEXT,application_start_date TEXT,application_end_date TEXT,application_link TEXT NOT NULL,official_notification_pdf_url TEXT,exam_date TEXT,result_date TEXT,source_site TEXT,country TEXT,state TEXT,status TEXT,requires_login INTEGER DEFAULT 0,raw_payload TEXT,created_at TEXT,updated_at TEXT)",
+"CREATE TABLE IF NOT EXISTS news_articles(id SERIAL PRIMARY KEY,title TEXT NOT NULL,summary TEXT NOT NULL,content_url TEXT NOT NULL UNIQUE,source_name TEXT NOT NULL,category TEXT NOT NULL,tags TEXT,published_at TEXT,scraped_at TEXT,related_entity_ids TEXT,image_url TEXT,is_featured INTEGER DEFAULT 0,raw_payload TEXT,created_at TEXT)",
+"CREATE TABLE IF NOT EXISTS research_items(id SERIAL PRIMARY KEY,title TEXT NOT NULL,authors TEXT NOT NULL,abstract TEXT,type TEXT NOT NULL,field TEXT NOT NULL,subfield TEXT,keywords TEXT,institution_id INTEGER,institution_name TEXT,published_date TEXT,doi TEXT,arxiv_id TEXT,pdf_url TEXT,source_url TEXT,citation_count INTEGER,status TEXT,title_author_hash TEXT NOT NULL,raw_payload TEXT,created_at TEXT,updated_at TEXT)",
 ]
 
 def db_migrate():
@@ -92,7 +103,7 @@ def _canon(u): p=urlparse(u); return f"{p.scheme}://{p.netloc}{p.path}" if p.sch
 def _robots(url):
     if url.startswith("file://"): return True,"file_url"
     p=urlparse(url); rp=robotparser.RobotFileParser(); rp.set_url(f"{p.scheme}://{p.netloc}/robots.txt")
-    try: rp.read(); ok=rp.can_fetch("ccdata-lite-bot",url); return ok,"robots_checked"
+    try: rp.read(); ok=rp.can_fetch(get_random_ua(),url); return ok,"robots_checked"
     except Exception: return True,"robots_error_allow"
 
 def _ptype(u):
@@ -115,6 +126,19 @@ class Repo:
             c.execute("CREATE TABLE IF NOT EXISTS public_entities(id INTEGER PRIMARY KEY,entity_record_id INTEGER UNIQUE,source_id INTEGER,entity_type TEXT,title TEXT,slug TEXT UNIQUE,location TEXT,country TEXT,summary TEXT,page_json TEXT,search_text TEXT,confidence_score REAL,lifecycle_state TEXT,published_version INTEGER,canonical_entity_id TEXT,created_at TEXT,updated_at TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY,entity_record_id INTEGER,action TEXT,notes TEXT,reviewed_by TEXT,created_at TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS crawl_jobs(id INTEGER PRIMARY KEY,source_id INTEGER,job_type TEXT,status TEXT,dry_run INTEGER,priority INTEGER,payload_json TEXT,result_json TEXT,error_message TEXT,idempotency_key TEXT,created_at TEXT,started_at TEXT,completed_at TEXT,retry_count INTEGER DEFAULT 0,next_retry_at TEXT,last_error TEXT)")
+            c.execute(SQLITE_CREATE_ADMISSIONS)
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_admissions_entity_program_year ON admissions(entity_id, program_name, intake_year)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_admissions_status_state_type ON admissions(status, state, admission_type)")
+            c.execute(SQLITE_CREATE_JOBS)
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_jobs_title_org_end ON jobs(title, organization, application_end_date)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_type_category_state_status ON jobs(job_type, category, state, status)")
+            c.execute(SQLITE_CREATE_INSTITUTIONS)
+            c.execute(SQLITE_CREATE_NEWS)
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_news_title_source_published ON news_articles(title, source_name, published_at)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_news_category_published ON news_articles(category, published_at)")
+            c.execute(SQLITE_CREATE_RESEARCH)
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_research_title_author_hash ON research_items(title_author_hash)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_research_field_type_year ON research_items(field, type, published_date)")
 
             try: c.execute('ALTER TABLE published_records ADD COLUMN idempotency_key TEXT')
             except Exception: pass
@@ -234,9 +258,9 @@ def _parse_env_list(name):
 
 def _fetch_extract_resilient(url, timeout=15):
     max_retries=int(os.getenv('CRAWL_MAX_RETRIES','2')); base=float(os.getenv('CRAWL_BACKOFF_BASE_SECONDS','0.05'))
-    uas=_parse_env_list('CRAWL_USER_AGENTS') or ['ccdata-lite-bot/1.0']; proxies=_parse_env_list('HTTP_PROXY_LIST')
+    proxies=_parse_env_list('HTTP_PROXY_LIST')
     for i in range(max_retries+1):
-        _ua=uas[i % len(uas)]; _px=proxies[i % len(proxies)] if proxies else None
+        _px=proxies[i % len(proxies)] if proxies else None
         try:
             sim=os.getenv('CRAWL_SIMULATE_STATUS','')
             if sim:
@@ -256,12 +280,13 @@ def _fetch_extract_resilient(url, timeout=15):
             msg=str(e)
             if 'blocked:403' in msg or 'cooldown:429' in msg: raise
             if i<max_retries:
-                time.sleep(base*(2**i)+random.uniform(0,base)); continue
+                time.sleep(max(0.0, add_jitter(base*(2**i)))); continue
             raise
 
 def _canonical_sig(rec):
     nm=(rec.get('fields',{}).get('name') or rec.get('title') or '').strip().lower()
-    loc=(rec.get('fields',{}).get('location') or '').strip().lower()
+    loc_val=rec.get('fields',{}).get('location') or ''
+    loc=(json.dumps(loc_val,sort_keys=True) if isinstance(loc_val,dict) else str(loc_val)).strip().lower()
     dom=urlparse(rec.get('official_url') or rec.get('source_url') or '').netloc.lower()
     return hashlib.sha1(f'{nm}|{loc}|{dom}'.encode()).hexdigest()
 
@@ -315,31 +340,163 @@ def _upsert_public_entity(c, entity_record_id, source_id, entity_type, rec, vers
 
 def crawl_source(id,dry=False):
     cfg=_cfg(); repo=Repo(cfg.database_url); repo.init(); sid,etype,name,url,trust=repo.get_source(id)
-    plan=discover(url,cfg,repo); pages=[]
-    for p in plan:
-        if not p['robots_allowed']: repo.log(p['url'],'blocked','robots'); continue
-        try: pages.append({"url":p['url'],"extract":_fetch_extract_resilient(p['url'], timeout=cfg.timeout),"page_type":p['page_type']})
-        except Exception as e:
-            m=str(e)
-            if 'blocked:403' in m: repo.log(p['url'],'blocked','403')
-            elif 'cooldown:429' in m: repo.log(p['url'],'cooldown','429')
-            else: repo.log(p['url'],'error',m)
-    rec=merge_pages(etype,name,url,pages,trust); rec['source_id']=sid; rec['canonical_entity_id']=_canonical_sig(rec)
+    profile=asyncio.run(deep_crawl_institution(url,entity_type=etype,max_pages=cfg.max_pages,rate_limit_seconds=float(os.getenv('CRAWL_RATE_LIMIT_SECONDS','1.5'))))
+    rec=_deep_profile_to_record(sid,etype,name,url,trust,profile)
+    rec['lifecycle_state']='pending_review'
+    if dry:
+        return {"dry_run":True,"record":rec}
+    st=repo.save_entity(rec)
     with sqlite3.connect(repo.path) as c:
-        dup=c.execute('select id from crawler_records where canonical_entity_id=? and source_id!=? limit 1',(rec['canonical_entity_id'],sid)).fetchone()
-    if dup: rec['duplicate_of']=dup[0]
-    req=REQ_BY_TYPE.get(etype,REQ_COLLEGE)
-    if etype=='college':
-        valid=rec['confidence_score']>=0.65 and (1-len(rec['missing_fields'])/max(1,len(req)))>=0.7 and rec['trust_tier'] in TRUST and rec['content_hash']
-    else:
-        valid=bool(rec.get('content_hash')) and rec['trust_tier'] in TRUST
-    qr=quality_report(plan,pages,rec,'pass' if valid else 'fail','quality_gate_failed' if not valid else '')
-    if dry: return {"dry_run":True,"quality_report":qr,"record":rec}
-    st=repo.save_entity(rec) if valid else (repo.save_quarantine(url,rec,'quality_gate_failed') or 'quarantined')
-    if st in {'created','updated','unchanged'}:
+        c.execute('UPDATE source_registry SET last_crawled_at=?,updated_at=? WHERE id=?',(datetime.now(timezone.utc).isoformat(),datetime.now(timezone.utc).isoformat(),sid)); c.commit()
+    return {"source_id":sid,"status":st,"record":rec}
+
+
+def _deep_profile_to_record(sid, etype, name, url, trust, profile):
+    fields = {
+        "name": name,
+        "official_website": url,
+        "about": profile.get("about", ""),
+        "courses": profile.get("courses", []),
+        "fees": profile.get("fees", []),
+        "faculty": profile.get("faculty", []),
+        "gallery": profile.get("images", []),
+        "contact": profile.get("contact", {}),
+        "placement": profile.get("placement_stats", []),
+    }
+    missing = [field for field in ["about", "courses", "fees", "faculty", "contact"] if not fields.get(field)]
+    confidence = round((1 - len(missing) / 5) * 0.7 + TRUST.get(trust, 0.6) * 0.3, 3)
+    rec = {
+        "entity_type": etype,
+        "title": name,
+        "source_url": url,
+        "official_url": url,
+        "fields": fields,
+        "metadata": {"deep_crawl": True, "page_count": profile.get("pages_crawled", 0)},
+        "missing_fields": missing,
+        "confidence_score": confidence,
+        "trust_tier": trust,
+        "content_hash": hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest(),
+        "last_crawled_at": datetime.now(timezone.utc).isoformat(),
+        "source_id": sid,
+    }
+    rec["canonical_entity_id"] = _canonical_sig(rec)
+    return rec
+
+
+def deep_crawl_source(source_id, max_pages=40, dry_run=False):
+    cfg = _cfg()
+    repo = Repo(cfg.database_url)
+    repo.init()
+    sid, etype, name, url, trust = repo.get_source(source_id)
+    profile = asyncio.run(DeepCrawler().crawl_institution(url, etype, max_pages=max_pages))
+    if not profile:
+        return {"source_id": sid, "status": "empty", "record": {}}
+    rec = _deep_profile_to_record(sid, etype, name, url, trust, profile)
+    if dry_run:
+        return {"source_id": sid, "dry_run": True, "record": rec}
+    status = repo.save_entity(rec)
+    return {"source_id": sid, "status": status, "record": rec}
+
+
+def deep_crawl_all(max_pages=40, dry_run=False):
+    repo = Repo(_cfg().database_url)
+    repo.init()
+    results = []
+    for source in repo.list_sources():
+        if not source[5]:
+            continue
+        results.append(deep_crawl_source(source[0], max_pages=max_pages, dry_run=dry_run))
+    return {"count": len(results), "results": results}
+
+
+def research_items_list(field=None,item_type=None,year=None,institution_id=None,limit=100):
+    return ResearchRepository(_cfg().database_url).list(field=field,item_type=item_type,year=year,institution_id=institution_id,limit=limit)
+
+def research_items_get(item_id):
+    return ResearchRepository(_cfg().database_url).get(item_id)
+
+def research_items_search(query,limit=100):
+    return ResearchRepository(_cfg().database_url).search(query,limit=limit)
+
+def research_items_crawl(query=None,seed_url=None,include_arxiv=True):
+    queries=[query] if query else None
+    seeds=[seed_url] if seed_url else []
+    return crawl_research_sync(_cfg().database_url, queries=queries, seed_urls=seeds, include_arxiv=include_arxiv)
+
+def news_articles_list(category=None,days=None,entity_id=None,limit=100):
+    return NewsRepository(_cfg().database_url).list(category=category,days=days,entity_id=entity_id,limit=limit)
+
+def news_articles_featured(limit=100):
+    return NewsRepository(_cfg().database_url).list(featured=True,limit=limit)
+
+def news_articles_get(article_id):
+    return NewsRepository(_cfg().database_url).get(article_id)
+
+def news_articles_crawl(source_url=None):
+    sources=[source_url] if source_url else None
+    return crawl_news_sync(_cfg().database_url, sources=sources)
+
+def job_postings_list(job_type=None,category=None,state=None,status=None,location=None,stipend_min=None,limit=100):
+    return JobsRepository(_cfg().database_url).list(job_type=job_type,category=category,state=state,status=status,location=location,stipend_min=stipend_min,limit=limit)
+
+def job_postings_get(job_id):
+    return JobsRepository(_cfg().database_url).get(job_id)
+
+def job_postings_search(query,limit=100):
+    return JobsRepository(_cfg().database_url).search(query,limit=limit)
+
+def job_postings_mark_closed():
+    return {"closed":JobsRepository(_cfg().database_url).mark_closed()}
+
+def job_postings_crawl(job_type='private',query=None,seed_url=None):
+    seeds=[seed_url] if seed_url else []
+    return crawl_jobs_sync(_cfg().database_url, seed_urls=seeds, job_type=job_type, query=query)
+
+def admissions_list(status=None,state=None,admission_type=None,country=None,limit=100):
+    return AdmissionsRepository(_cfg().database_url).list(status=status,state=state,admission_type=admission_type,country=country,limit=limit)
+
+def admissions_get(admission_id):
+    return AdmissionsRepository(_cfg().database_url).get(admission_id)
+
+def admissions_upcoming(days=30):
+    return AdmissionsRepository(_cfg().database_url).upcoming(days)
+
+def admissions_mark_closed():
+    return {"closed":AdmissionsRepository(_cfg().database_url).mark_closed()}
+
+def admissions_crawl(entity_name, source_url=None, entity_id=None, intake_year=None):
+    return crawl_admissions_sync(_cfg().database_url, entity_id=entity_id, entity_name=entity_name, source_url=source_url, intake_year=intake_year)
+
+def institution_crawl(url, entity_type, dry=False):
+    cfg=_cfg(); repo=Repo(cfg.database_url); repo.init()
+    result=crawl_institution_sync(url, entity_type)
+    if result.record is None:
+        if not dry:
+            repo.save_quarantine(url,{"url":url,"entity_type":entity_type,"pages_crawled":result.pages_crawled},result.reason)
+        return {"status":"quarantined","reason":result.reason,"pages_crawled":result.pages_crawled}
+    rec=result.record
+    rec['canonical_entity_id']=_canonical_sig(rec)
+    if dry:
+        return {"dry_run":True,"status":result.status,"record":rec,"pages_crawled":result.pages_crawled,"raw_html_keys":result.raw_html_keys}
+    status=repo.save_entity(rec)
+    return {"status":status,"pages_crawled":result.pages_crawled,"raw_html_keys":result.raw_html_keys,"title":rec.get('title'),"entity_type":rec.get('entity_type')}
+
+def institution_crawl_bulk(file_path, dry=False):
+    rows=read_bulk_csv(file_path); results=[]
+    for row in rows:
+        results.append({"url":row['url'],"entity_type":row['entity_type'],"result":institution_crawl(row['url'],row['entity_type'],dry=dry)})
+    return {"count":len(results),"results":results}
+
+def institution_refresh(source_id, dry=False):
+    repo=Repo(_cfg().database_url); repo.init(); src=repo.get_source(source_id)
+    if not src: return {"status":"not_found","source_id":source_id}
+    sid,etype,name,url,trust=src
+    res=institution_crawl(url,etype,dry=dry)
+    if res.get('status') in {'created','updated','unchanged'} and not dry:
         with sqlite3.connect(repo.path) as c:
             c.execute('UPDATE source_registry SET last_crawled_at=?,updated_at=? WHERE id=?',(datetime.now(timezone.utc).isoformat(),datetime.now(timezone.utc).isoformat(),sid)); c.commit()
-    return {"source_id":sid,"status":st,"quality_report":qr}
+    res['source_id']=sid
+    return res
 
 def export_entity(eid): repo=Repo(_cfg().database_url); repo.init(); return repo.get_entity(eid)
 
@@ -374,7 +531,7 @@ def readiness_check():
         pending=0
         quarantine=c.execute('select count(*) from quarantine_records').fetchone()[0]
         errs=c.execute("select count(*) from crawl_logs where status='error'").fetchone()[0]
-    return {"deps":{"sqlite3":True,"httpx_optional":True},"runtime_profile":os.getenv('RUNTIME_PROFILE','no-docker'),"db_connectivity":True,"queue_backend":os.getenv('QUEUE_BACKEND','memory'),"webclaw_enabled":os.getenv('WEBCLAW_ENABLED','false'),"crawler_limits":{"max_pages":cfg.max_pages,"timeout":cfg.timeout,"same_domain":cfg.same_domain},"allowed_domains":sorted(cfg.allowlist),"storage_status":{"db_path":repo.path},"pending_crawl_tasks":pending,"quarantine_count":quarantine,"last_crawl_log_errors":errs}
+    return {"deps":{"sqlite3":True,"httpx_optional":True},"runtime_profile":os.getenv('RUNTIME_PROFILE','no-docker'),"db_connectivity":True,"queue_backend":os.getenv('QUEUE_BACKEND','memory'),"crawler_limits":{"max_pages":cfg.max_pages,"timeout":cfg.timeout,"same_domain":cfg.same_domain},"allowed_domains":sorted(cfg.allowlist),"storage_status":{"db_path":repo.path},"pending_crawl_tasks":pending,"quarantine_count":quarantine,"last_crawl_log_errors":errs}
 
 def audit_export():
     repo=Repo(_cfg().database_url); repo.init()
@@ -781,6 +938,9 @@ def main():
     sub.add_parser('source:list')
     p=sub.add_parser('source:preview'); p.add_argument('--id',type=int,required=True)
     c=sub.add_parser('source:crawl'); c.add_argument('--id',type=int,required=True); c.add_argument('--dry-run',action='store_true')
+    dc=sub.add_parser('source:deep-crawl'); dc.add_argument('--id',type=int,required=True); dc.add_argument('--max-pages',type=int,default=40); dc.add_argument('--dry-run',action='store_true')
+    dca=sub.add_parser('source:deep-crawl-all'); dca.add_argument('--dry-run',action='store_true')
+    cs=sub.add_parser('crawl:single'); cs.add_argument('--url',required=True); cs.add_argument('--entity-type',default='college')
     e=sub.add_parser('export:entity'); e.add_argument('--id',type=int,required=True); e.add_argument('--format',default='json')
     t=sub.add_parser('extract:test'); t.add_argument('--url',required=True)
     d=sub.add_parser('extract:debug'); d.add_argument('--url',required=True)
@@ -804,6 +964,25 @@ def main():
     rap=sub.add_parser('record:approve'); rap.add_argument('--id',type=int,required=True); rap.add_argument('--reviewed-by',required=True); rap.add_argument('--force',action='store_true')
     rrj=sub.add_parser('record:reject'); rrj.add_argument('--id',type=int,required=True); rrj.add_argument('--reviewed-by',required=True); rrj.add_argument('--notes',default='')
     rsd=sub.add_parser('review:seed'); rsd.add_argument('--entity-id',type=int,required=True)
+    ic=sub.add_parser('institution:crawl'); ic.add_argument('--url',required=True); ic.add_argument('--type',dest='entity_type',required=True); ic.add_argument('--dry-run',action='store_true')
+    ib=sub.add_parser('institution:crawl-bulk'); ib.add_argument('--file',required=True); ib.add_argument('--dry-run',action='store_true')
+    irf=sub.add_parser('institution:refresh'); irf.add_argument('--id',type=int,required=True); irf.add_argument('--dry-run',action='store_true')
+    acl=sub.add_parser('admissions:list'); acl.add_argument('--status',default=None); acl.add_argument('--state',default=None); acl.add_argument('--type',dest='admission_type',default=None); acl.add_argument('--country',default=None); acl.add_argument('--limit',type=int,default=100)
+    acg=sub.add_parser('admissions:get'); acg.add_argument('--id',type=int,required=True)
+    acu=sub.add_parser('admissions:upcoming'); acu.add_argument('--days',type=int,default=30)
+    acc=sub.add_parser('admissions:crawl'); acc.add_argument('--entity-name',required=True); acc.add_argument('--source-url',default=None); acc.add_argument('--entity-id',type=int,default=None); acc.add_argument('--intake-year',type=int,default=None)
+    jpl=sub.add_parser('job-postings:list'); jpl.add_argument('--type',dest='job_type',default=None); jpl.add_argument('--category',default=None); jpl.add_argument('--state',default=None); jpl.add_argument('--status',default=None); jpl.add_argument('--location',default=None); jpl.add_argument('--stipend-min',type=int,default=None); jpl.add_argument('--limit',type=int,default=100)
+    jpg=sub.add_parser('job-postings:get'); jpg.add_argument('--id',type=int,required=True)
+    jps=sub.add_parser('job-postings:search'); jps.add_argument('--q',required=True); jps.add_argument('--limit',type=int,default=100)
+    jpc=sub.add_parser('job-postings:crawl'); jpc.add_argument('--type',dest='job_type',default='private'); jpc.add_argument('--query',default=None); jpc.add_argument('--seed-url',default=None)
+    nwl=sub.add_parser('news:list'); nwl.add_argument('--category',default=None); nwl.add_argument('--days',type=int,default=None); nwl.add_argument('--entity-id',type=int,default=None); nwl.add_argument('--limit',type=int,default=100)
+    nwg=sub.add_parser('news:get'); nwg.add_argument('--id',type=int,required=True)
+    sub.add_parser('news:featured')
+    nwc=sub.add_parser('news:crawl'); nwc.add_argument('--source-url',default=None)
+    rsl=sub.add_parser('research:list'); rsl.add_argument('--field',default=None); rsl.add_argument('--type',dest='item_type',default=None); rsl.add_argument('--year',type=int,default=None); rsl.add_argument('--institution-id',type=int,default=None); rsl.add_argument('--limit',type=int,default=100)
+    rsg=sub.add_parser('research:get'); rsg.add_argument('--id',type=int,required=True)
+    rss=sub.add_parser('research:search'); rss.add_argument('--q',required=True); rss.add_argument('--limit',type=int,default=100)
+    rsc=sub.add_parser('research:crawl'); rsc.add_argument('--query',default=None); rsc.add_argument('--seed-url',default=None); rsc.add_argument('--no-arxiv',action='store_true')
     args=pa.parse_args(); repo=Repo(_cfg().database_url); repo.init()
     if args.cmd=='init-db': print('initialized')
     elif args.cmd=='db:migrate': print(json.dumps(db_migrate(),indent=2))
@@ -826,8 +1005,20 @@ def main():
         if args.trigger_crawl: print(json.dumps(enqueue_job(sid,'crawl',False,5),indent=2))
     elif args.cmd=='search': print(json.dumps(_search(args.query,args.entity_type,args.location,args.country),indent=2))
     elif args.cmd=='source:list': print(json.dumps([{"id":r[0],"entity_type":r[1],"entity_name":r[2],"official_url":r[3],"trust_tier":r[4],"is_active":r[5]} for r in repo.list_sources()],indent=2))
-    elif args.cmd=='source:preview': s=repo.get_source(args.id); plan=discover(s[3],_cfg(),repo); print(json.dumps({"source_id":args.id,"estimated_page_count":len(plan),"urls":plan,"quality_report":{"pages_discovered":len(plan)}},indent=2))
+    elif args.cmd=='source:preview':
+        s=repo.get_source(args.id); url=s[3]; dc=DeepCrawler(max_pages=_cfg().max_pages)
+        js=asyncio.run(dc._detect_js_required(url))
+        origin=f'{urlparse(url).scheme}://{urlparse(url).netloc}'
+        paths=[p for p in PRIORITY_PATHS if not dc._skip_url(urljoin(origin,p))]
+        print(json.dumps({"source_id":args.id,"domain":urlparse(url).netloc,"js_required":"yes" if js else "no","priority_paths_found":paths,"estimated_pages_to_crawl":min(_cfg().max_pages,1+len(paths)),"robots_txt_disallowed_paths":[]},indent=2))
     elif args.cmd=='source:crawl': print(json.dumps(crawl_source(args.id,args.dry_run),indent=2))
+    elif args.cmd=='crawl:single': print(json.dumps(asyncio.run(deep_crawl_institution(args.url,args.entity_type,_cfg().max_pages,float(os.getenv('CRAWL_RATE_LIMIT_SECONDS','1.5')))),indent=2))
+    elif args.cmd=='source:deep-crawl': print(json.dumps(deep_crawl_source(args.id,args.max_pages,args.dry_run),indent=2))
+    elif args.cmd=='source:deep-crawl-all':
+        active=[r for r in repo.list_sources() if r[5]]; total=min(len(active),int(os.getenv('DAILY_MAX_JOBS','500'))); out=[]
+        for i,row in enumerate(active[:total],start=1):
+            out.append(crawl_source(row[0],args.dry_run)); print(f'Crawled {i}/{total} sources')
+        print(json.dumps({"count":len(out),"results":out},indent=2))
     elif args.cmd=='export:entity': print(json.dumps(export_entity(args.id),indent=2))
     elif args.cmd=='extract:test': print(json.dumps(extract_fallback(args.url),indent=2))
     elif args.cmd=='extract:debug': ex=extract_fallback(args.url); rec=merge_pages('college','debug',args.url,[{"url":args.url,"extract":ex,"page_type":"homepage"}],'official'); print(json.dumps({"detected_sections":ex.get('sections',{}),"extracted_fields":ex.get('field_details',{}),"missing_fields":rec['missing_fields'],"final_normalized_record":rec},indent=2))
@@ -855,5 +1046,24 @@ def main():
     elif args.cmd=='record:approve': print(json.dumps(record_approve(args.id,args.reviewed_by,args.force),indent=2))
     elif args.cmd=='record:reject': print(json.dumps(record_reject(args.id,args.reviewed_by,args.notes),indent=2))
     elif args.cmd=='review:seed': print(json.dumps(review_seed(args.entity_id),indent=2))
+    elif args.cmd=='institution:crawl': print(json.dumps(institution_crawl(args.url,args.entity_type,args.dry_run),indent=2))
+    elif args.cmd=='institution:crawl-bulk': print(json.dumps(institution_crawl_bulk(args.file,args.dry_run),indent=2))
+    elif args.cmd=='institution:refresh': print(json.dumps(institution_refresh(args.id,args.dry_run),indent=2))
+    elif args.cmd=='admissions:list': print(json.dumps(admissions_list(args.status,args.state,args.admission_type,args.country,args.limit),indent=2))
+    elif args.cmd=='admissions:get': print(json.dumps(admissions_get(args.id),indent=2))
+    elif args.cmd=='admissions:upcoming': print(json.dumps(admissions_upcoming(args.days),indent=2))
+    elif args.cmd=='admissions:crawl': print(json.dumps(admissions_crawl(args.entity_name,args.source_url,args.entity_id,args.intake_year),indent=2))
+    elif args.cmd=='job-postings:list': print(json.dumps(job_postings_list(args.job_type,args.category,args.state,args.status,args.location,args.stipend_min,args.limit),indent=2))
+    elif args.cmd=='job-postings:get': print(json.dumps(job_postings_get(args.id),indent=2))
+    elif args.cmd=='job-postings:search': print(json.dumps(job_postings_search(args.q,args.limit),indent=2))
+    elif args.cmd=='job-postings:crawl': print(json.dumps(job_postings_crawl(args.job_type,args.query,args.seed_url),indent=2))
+    elif args.cmd=='news:list': print(json.dumps(news_articles_list(args.category,args.days,args.entity_id,args.limit),indent=2))
+    elif args.cmd=='news:get': print(json.dumps(news_articles_get(args.id),indent=2))
+    elif args.cmd=='news:featured': print(json.dumps(news_articles_featured(),indent=2))
+    elif args.cmd=='news:crawl': print(json.dumps(news_articles_crawl(args.source_url),indent=2))
+    elif args.cmd=='research:list': print(json.dumps(research_items_list(args.field,args.item_type,args.year,args.institution_id,args.limit),indent=2))
+    elif args.cmd=='research:get': print(json.dumps(research_items_get(args.id),indent=2))
+    elif args.cmd=='research:search': print(json.dumps(research_items_search(args.q,args.limit),indent=2))
+    elif args.cmd=='research:crawl': print(json.dumps(research_items_crawl(args.query,args.seed_url,not args.no_arxiv),indent=2))
 
 if __name__=='__main__': main()

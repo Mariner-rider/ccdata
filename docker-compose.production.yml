@@ -1,27 +1,201 @@
-version: '3.9'
+version: "3.9"
+
 services:
   postgres:
-    image: postgres:16
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: crawler
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: crawler
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crawler -d crawler"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   redis:
-    image: redis:7
-  object-storage:
-    image: minio/minio:latest
-    command: server /data
-  queue-worker:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.worker
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:RELEASE.2025-01-20T14-49-07Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  createbucket:
+    image: minio/mc:RELEASE.2025-01-17T23-25-50Z
+    restart: unless-stopped
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      until /usr/bin/mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minio} ${MINIO_ROOT_PASSWORD}; do sleep 1; done;
+      /usr/bin/mc mb -p local/raw-html;
+      /usr/bin/mc anonymous set private local/raw-html;
+      exit 0;
+      "
+
   core-api:
     build:
       context: .
       dockerfile: docker/Dockerfile.core
+    restart: unless-stopped
+    command: uvicorn services.lite_pipeline.api:app --host 0.0.0.0 --port 8000 --workers 2
+    environment:
+      DATABASE_URL: postgresql://crawler:${POSTGRES_PASSWORD}@postgres:5432/crawler
+      POSTGRES_DSN: postgresql://crawler:${POSTGRES_PASSWORD}@postgres:5432/crawler
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_BACKEND: redis
+      SERVICE_API_KEY: ${SERVICE_API_KEY}
+      CRAWL_MAX_PAGES_PER_SOURCE: ${CRAWL_MAX_PAGES_PER_SOURCE:-40}
+      CRAWL_RATE_LIMIT_SECONDS: ${CRAWL_RATE_LIMIT_SECONDS:-1.5}
+      CRAWL_TIMEOUT_SECONDS: ${CRAWL_TIMEOUT_SECONDS:-30}
+      CRAWL_MAX_RETRIES: ${CRAWL_MAX_RETRIES:-3}
+      ADMIN_API_KEY: ${SERVICE_API_KEY}
+      PUBLIC_CORS_ORIGINS: ${PUBLIC_CORS_ORIGINS:-https://collegecue.com,https://www.collegecue.com}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET: raw-html
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minio}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    restart: unless-stopped
+    command: python -m services.lite_pipeline.main worker:run
+    environment:
+      DATABASE_URL: postgresql://crawler:${POSTGRES_PASSWORD}@postgres:5432/crawler
+      POSTGRES_DSN: postgresql://crawler:${POSTGRES_PASSWORD}@postgres:5432/crawler
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_BACKEND: redis
+      SERVICE_API_KEY: ${SERVICE_API_KEY}
+      CRAWL_MAX_PAGES_PER_SOURCE: ${CRAWL_MAX_PAGES_PER_SOURCE:-40}
+      CRAWL_RATE_LIMIT_SECONDS: ${CRAWL_RATE_LIMIT_SECONDS:-1.5}
+      CRAWL_TIMEOUT_SECONDS: ${CRAWL_TIMEOUT_SECONDS:-30}
+      CRAWL_MAX_RETRIES: ${CRAWL_MAX_RETRIES:-3}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET: raw-html
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minio}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
   browser-worker:
     build:
       context: .
       dockerfile: docker/Dockerfile.browser-worker
-    deploy:
-      replicas: 2
-  search:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.2
-  metrics:
-    image: prom/prometheus:latest
+    restart: unless-stopped
+    command: python -m services.lite_pipeline.main worker:run
+    environment:
+      DATABASE_URL: postgresql://crawler:${POSTGRES_PASSWORD}@postgres:5432/crawler
+      POSTGRES_DSN: postgresql://crawler:${POSTGRES_PASSWORD}@postgres:5432/crawler
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_BACKEND: redis
+      SERVICE_API_KEY: ${SERVICE_API_KEY}
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  airflow-init:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    restart: unless-stopped
+    entrypoint: /bin/bash
+    command: -c "airflow db migrate && airflow users create --username ${AIRFLOW_ADMIN_USERNAME:-airflow_user} --password ${AIRFLOW_ADMIN_PASSWORD} --firstname Air --lastname Flow --role Admin --email ${AIRFLOW_ADMIN_EMAIL:-airflow@collegecue.com} || true"
+    environment: &airflow_env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://crawler:${POSTGRES_PASSWORD}@postgres:5432/crawler
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+      DATABASE_URL: postgresql://crawler:${POSTGRES_PASSWORD}@postgres:5432/crawler
+      POSTGRES_DSN: postgresql://crawler:${POSTGRES_PASSWORD}@postgres:5432/crawler
+      REDIS_URL: redis://redis:6379/0
+      SERVICE_API_KEY: ${SERVICE_API_KEY}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    restart: unless-stopped
+    command: airflow scheduler
+    environment:
+      <<: *airflow_env
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+    depends_on:
+      airflow-init:
+        condition: service_started
+
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    restart: unless-stopped
+    command: airflow webserver
+    environment:
+      <<: *airflow_env
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+    depends_on:
+      airflow-init:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:

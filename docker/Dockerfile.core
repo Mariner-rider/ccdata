@@ -2,9 +2,8 @@ FROM python:3.12-slim AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 RUN useradd -m appuser
-COPY services/requirements-core.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY pyproject.toml README.md /app/
 COPY services /app/services
-COPY services/lite_pipeline /app/services/lite_pipeline
+RUN pip install --no-cache-dir -e ".[webclaw,postgres,redis]" fastapi==0.115.12 uvicorn==0.34.0
 USER appuser
-CMD ["python", "-m", "services.lite_pipeline.main", "crawl:single", "--url", "https://example.com"]
+CMD ["uvicorn", "services.lite_pipeline.api:app", "--host", "0.0.0.0", "--port", "8000"]
