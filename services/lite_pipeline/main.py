@@ -1,17 +1,19 @@
 from __future__ import annotations
-import argparse, hashlib, json, os, random, sqlite3, time
+import argparse, asyncio, hashlib, json, os, sqlite3, time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from urllib import robotparser
+from services.common.user_agents import add_jitter, get_random_ua
 from services.extraction.webclaw_adapter.fallback_extractor import extract_fallback
 from services.institutions.crawler import crawl_institution_sync, read_bulk_csv
 from services.admissions.crawler import AdmissionsRepository, SQLITE_CREATE_ADMISSIONS, crawl_admissions_sync
 from services.jobs.crawler import JobsRepository, SQLITE_CREATE_JOBS, crawl_jobs_sync
 from services.news.crawler import NewsRepository, SQLITE_CREATE_INSTITUTIONS, SQLITE_CREATE_NEWS, crawl_news_sync
 from services.research.crawler import ResearchRepository, SQLITE_CREATE_RESEARCH, crawl_research_sync
+from services.deep_crawler.crawler import DeepCrawler
 try:
     import psycopg
 except Exception:
@@ -101,7 +103,7 @@ def _canon(u): p=urlparse(u); return f"{p.scheme}://{p.netloc}{p.path}" if p.sch
 def _robots(url):
     if url.startswith("file://"): return True,"file_url"
     p=urlparse(url); rp=robotparser.RobotFileParser(); rp.set_url(f"{p.scheme}://{p.netloc}/robots.txt")
-    try: rp.read(); ok=rp.can_fetch("ccdata-lite-bot",url); return ok,"robots_checked"
+    try: rp.read(); ok=rp.can_fetch(get_random_ua(),url); return ok,"robots_checked"
     except Exception: return True,"robots_error_allow"
 
 def _ptype(u):
@@ -256,9 +258,9 @@ def _parse_env_list(name):
 
 def _fetch_extract_resilient(url, timeout=15):
     max_retries=int(os.getenv('CRAWL_MAX_RETRIES','2')); base=float(os.getenv('CRAWL_BACKOFF_BASE_SECONDS','0.05'))
-    uas=_parse_env_list('CRAWL_USER_AGENTS') or ['ccdata-lite-bot/1.0']; proxies=_parse_env_list('HTTP_PROXY_LIST')
+    proxies=_parse_env_list('HTTP_PROXY_LIST')
     for i in range(max_retries+1):
-        _ua=uas[i % len(uas)]; _px=proxies[i % len(proxies)] if proxies else None
+        _px=proxies[i % len(proxies)] if proxies else None
         try:
             sim=os.getenv('CRAWL_SIMULATE_STATUS','')
             if sim:
@@ -278,7 +280,7 @@ def _fetch_extract_resilient(url, timeout=15):
             msg=str(e)
             if 'blocked:403' in msg or 'cooldown:429' in msg: raise
             if i<max_retries:
-                time.sleep(base*(2**i)+random.uniform(0,base)); continue
+                time.sleep(max(0.0, add_jitter(base*(2**i)))); continue
             raise
 
 def _canonical_sig(rec):
@@ -365,9 +367,62 @@ def crawl_source(id,dry=False):
     return {"source_id":sid,"status":st,"quality_report":qr}
 
 
+def _deep_profile_to_record(sid, etype, name, url, trust, profile):
+    fields = {
+        "name": name,
+        "official_website": url,
+        "about": profile.get("about", ""),
+        "courses": profile.get("courses", []),
+        "fees": profile.get("fees", []),
+        "faculty": profile.get("faculty", []),
+        "gallery": profile.get("images", []),
+        "contact": profile.get("contact", {}),
+        "placement": profile.get("placement_stats", []),
+    }
+    missing = [field for field in ["about", "courses", "fees", "faculty", "contact"] if not fields.get(field)]
+    confidence = round((1 - len(missing) / 5) * 0.7 + TRUST.get(trust, 0.6) * 0.3, 3)
+    rec = {
+        "entity_type": etype,
+        "title": name,
+        "source_url": url,
+        "official_url": url,
+        "fields": fields,
+        "metadata": {"deep_crawl": True, "page_count": profile.get("pages_crawled", 0)},
+        "missing_fields": missing,
+        "confidence_score": confidence,
+        "trust_tier": trust,
+        "content_hash": hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest(),
+        "last_crawled_at": datetime.now(timezone.utc).isoformat(),
+        "source_id": sid,
+    }
+    rec["canonical_entity_id"] = _canonical_sig(rec)
+    return rec
 
 
+def deep_crawl_source(source_id, max_pages=40, dry_run=False):
+    cfg = _cfg()
+    repo = Repo(cfg.database_url)
+    repo.init()
+    sid, etype, name, url, trust = repo.get_source(source_id)
+    profile = asyncio.run(DeepCrawler().crawl_institution(url, etype, max_pages=max_pages))
+    if not profile:
+        return {"source_id": sid, "status": "empty", "record": {}}
+    rec = _deep_profile_to_record(sid, etype, name, url, trust, profile)
+    if dry_run:
+        return {"source_id": sid, "dry_run": True, "record": rec}
+    status = repo.save_entity(rec)
+    return {"source_id": sid, "status": status, "record": rec}
 
+
+def deep_crawl_all(max_pages=40, dry_run=False):
+    repo = Repo(_cfg().database_url)
+    repo.init()
+    results = []
+    for source in repo.list_sources():
+        if not source[5]:
+            continue
+        results.append(deep_crawl_source(source[0], max_pages=max_pages, dry_run=dry_run))
+    return {"count": len(results), "results": results}
 
 
 def research_items_list(field=None,item_type=None,year=None,institution_id=None,limit=100):
@@ -899,6 +954,8 @@ def main():
     sub.add_parser('source:list')
     p=sub.add_parser('source:preview'); p.add_argument('--id',type=int,required=True)
     c=sub.add_parser('source:crawl'); c.add_argument('--id',type=int,required=True); c.add_argument('--dry-run',action='store_true')
+    dc=sub.add_parser('source:deep-crawl'); dc.add_argument('--id',type=int,required=True); dc.add_argument('--max-pages',type=int,default=40); dc.add_argument('--dry-run',action='store_true')
+    dca=sub.add_parser('source:deep-crawl-all'); dca.add_argument('--max-pages',type=int,default=40); dca.add_argument('--dry-run',action='store_true')
     e=sub.add_parser('export:entity'); e.add_argument('--id',type=int,required=True); e.add_argument('--format',default='json')
     t=sub.add_parser('extract:test'); t.add_argument('--url',required=True)
     d=sub.add_parser('extract:debug'); d.add_argument('--url',required=True)
@@ -963,8 +1020,10 @@ def main():
         if args.trigger_crawl: print(json.dumps(enqueue_job(sid,'crawl',False,5),indent=2))
     elif args.cmd=='search': print(json.dumps(_search(args.query,args.entity_type,args.location,args.country),indent=2))
     elif args.cmd=='source:list': print(json.dumps([{"id":r[0],"entity_type":r[1],"entity_name":r[2],"official_url":r[3],"trust_tier":r[4],"is_active":r[5]} for r in repo.list_sources()],indent=2))
-    elif args.cmd=='source:preview': s=repo.get_source(args.id); plan=discover(s[3],_cfg(),repo); print(json.dumps({"source_id":args.id,"estimated_page_count":len(plan),"urls":plan,"quality_report":{"pages_discovered":len(plan)}},indent=2))
+    elif args.cmd=='source:preview': s=repo.get_source(args.id); plan=discover(s[3],_cfg(),repo); deep_estimate=min(40, 1+len(DeepCrawler.PRIORITY_PATHS)); print(json.dumps({"source_id":args.id,"estimated_page_count":len(plan),"estimated_deep_page_count":deep_estimate,"urls":plan,"quality_report":{"pages_discovered":len(plan)}},indent=2))
     elif args.cmd=='source:crawl': print(json.dumps(crawl_source(args.id,args.dry_run),indent=2))
+    elif args.cmd=='source:deep-crawl': print(json.dumps(deep_crawl_source(args.id,args.max_pages,args.dry_run),indent=2))
+    elif args.cmd=='source:deep-crawl-all': print(json.dumps(deep_crawl_all(args.max_pages,args.dry_run),indent=2))
     elif args.cmd=='export:entity': print(json.dumps(export_entity(args.id),indent=2))
     elif args.cmd=='extract:test': print(json.dumps(extract_fallback(args.url),indent=2))
     elif args.cmd=='extract:debug': ex=extract_fallback(args.url); rec=merge_pages('college','debug',args.url,[{"url":args.url,"extract":ex,"page_type":"homepage"}],'official'); print(json.dumps({"detected_sections":ex.get('sections',{}),"extracted_fields":ex.get('field_details',{}),"missing_fields":rec['missing_fields'],"final_normalized_record":rec},indent=2))

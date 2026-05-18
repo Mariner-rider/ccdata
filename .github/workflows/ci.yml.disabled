@@ -1,0 +1,28 @@
+# CI IS CURRENTLY DISABLED.
+# To activate: rename this file to ci.yml
+# Then add these GitHub repository secrets:
+#   POSTGRES_PASSWORD, MINIO_ROOT_PASSWORD, SERVICE_API_KEY
+# No other changes needed — the workflow is ready to run as-is.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -e ".[dev,webclaw,postgres,redis]"
+      - name: Lint
+        run: ruff check services/ tests/
+      - name: Tests
+        run: pytest tests/ -q --tb=short

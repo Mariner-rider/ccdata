@@ -12,6 +12,7 @@ from w3lib.url import canonicalize_url
 from services.common.config import settings
 from services.common.db import get_conn
 from services.common.kafka_client import build_consumer, build_producer
+from services.common.user_agents import add_jitter, get_headers, get_random_ua
 
 
 UPSERT_PAGE_STATE = """
@@ -44,9 +45,9 @@ class SingleURLSpider(Spider):
 
     custom_settings = {
         "ROBOTSTXT_OBEY": True,
-        "DOWNLOAD_DELAY": settings.per_domain_delay_seconds,
+        "DOWNLOAD_DELAY": add_jitter(settings.per_domain_delay_seconds),
         "AUTOTHROTTLE_ENABLED": True,
-        "USER_AGENT": settings.crawler_user_agent,
+        "USER_AGENT": get_random_ua(),
         "LOG_LEVEL": "INFO",
     }
 
@@ -57,7 +58,7 @@ class SingleURLSpider(Spider):
         self.existing_state = existing_state or {}
 
     def start_requests(self):
-        headers = {}
+        headers = get_headers(self.task["url"])
         if self.existing_state.get("etag"):
             headers["If-None-Match"] = self.existing_state["etag"]
         if self.existing_state.get("last_modified"):

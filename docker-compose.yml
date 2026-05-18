@@ -5,7 +5,7 @@ services:
     image: postgres:16
     environment:
       POSTGRES_USER: crawler
-      POSTGRES_PASSWORD: crawler
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
       POSTGRES_DB: crawler
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -46,8 +46,8 @@ services:
     image: minio/minio:RELEASE.2025-01-20T14-49-07Z
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minio
-      MINIO_ROOT_PASSWORD: minio123
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}
     volumes:
       - minio:/data
 
@@ -56,7 +56,7 @@ services:
     depends_on: [minio]
     entrypoint: >
       /bin/sh -c "
-      until /usr/bin/mc alias set local http://minio:9000 minio minio123; do sleep 1; done;
+      until /usr/bin/mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minio} ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}; do sleep 1; done;
       /usr/bin/mc mb -p local/raw-html;
       /usr/bin/mc anonymous set private local/raw-html;
       exit 0;
@@ -67,19 +67,19 @@ services:
       context: .
       dockerfile: airflow/Dockerfile
     entrypoint: /bin/bash
-    command: -c "airflow db migrate && airflow users create --username admin --password admin --firstname Air --lastname Flow --role Admin --email admin@ccdata.local"
+    command: -c "airflow db migrate && airflow users create --username ${AIRFLOW_ADMIN_USERNAME:-airflow_admin} --password ${AIRFLOW_ADMIN_PASSWORD:?AIRFLOW_ADMIN_PASSWORD must be set} --firstname Air --lastname Flow --role Admin --email airflow@ccdata.local"
     environment: &airflow_env
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://crawler:crawler@postgres:5432/crawler
-      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://crawler:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/crawler
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?}
       AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
-      POSTGRES_DSN: postgresql://crawler:crawler@postgres:5432/crawler
+      POSTGRES_DSN: postgresql://crawler:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/crawler
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       CRAWL_QUEUE_TOPIC: crawl.queue
       REALTIME_CRAWL_REQUEST_TOPIC: crawl.requests.realtime
       REVIEW_EVENTS_TOPIC: reviews.events
-      SERVICE_API_KEY: ${SERVICE_API_KEY:-change-me}
+      SERVICE_API_KEY: ${SERVICE_API_KEY:?SERVICE_API_KEY must be set}
       API_RATE_LIMIT_PER_MINUTE: 120
       ALERT_SMTP_HOST: ${ALERT_SMTP_HOST:-}
       ALERT_SMTP_PORT: ${ALERT_SMTP_PORT:-25}
@@ -120,7 +120,7 @@ services:
     command: python -m services.seed_loader.main
     depends_on: [postgres, kafka]
     environment: &crawler_env
-      POSTGRES_DSN: postgresql://crawler:crawler@postgres:5432/crawler
+      POSTGRES_DSN: postgresql://crawler:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/crawler
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       CRAWL_QUEUE_TOPIC: crawl.queue
       CRAWL_RESULTS_TOPIC: crawl.results
@@ -128,11 +128,11 @@ services:
       SCHEMA_MAPPED_TOPIC: schema.mapped
       ENRICHED_RESULTS_TOPIC: content.enriched
       COLLEGE_PAGE_EVENTS_TOPIC: college.pages.events
-      CHATBOT_POSTGRES_DSN: postgresql://crawler:crawler@postgres:5432/crawler
+      CHATBOT_POSTGRES_DSN: postgresql://crawler:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/crawler
       ELASTICSEARCH_URL: http://elasticsearch:9200
       REALTIME_CRAWL_REQUEST_TOPIC: crawl.requests.realtime
       REVIEW_EVENTS_TOPIC: reviews.events
-      SERVICE_API_KEY: ${SERVICE_API_KEY:-change-me}
+      SERVICE_API_KEY: ${SERVICE_API_KEY:?SERVICE_API_KEY must be set}
       API_RATE_LIMIT_PER_MINUTE: 120
       FRESHNESS_DAYS_THRESHOLD: 30
       FRESHNESS_SCAN_INTERVAL_SECONDS: 300
@@ -140,7 +140,7 @@ services:
       S3_ENDPOINT_URL: http://minio:9000
       S3_BUCKET: raw-html
       S3_ACCESS_KEY: minio
-      S3_SECRET_KEY: minio123
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}
       SEED_DISPATCH_INTERVAL_SECONDS: 30
 
   scrapy-crawler:
@@ -152,7 +152,6 @@ services:
     environment:
       <<: *crawler_env
       PER_DOMAIN_DELAY_SECONDS: 1.0
-      CRAWLER_USER_AGENT: ccdata-distributed-crawler/1.0
 
   parser-engine:
     build:

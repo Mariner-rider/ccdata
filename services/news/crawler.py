@@ -20,6 +20,8 @@ from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 
+from services.common.user_agents import add_jitter, get_headers, get_random_ua
+
 LOGGER = logging.getLogger(__name__)
 
 if importlib.util.find_spec("firecrawl"):
@@ -169,7 +171,7 @@ class ThumbnailStore:
             data = Path(urlparse(image_url).path).read_bytes()
             content_type = "image/jpeg"
         else:
-            with urlopen(Request(image_url, headers={"User-Agent": os.getenv("CRAWLER_USER_AGENT", "CollegeCueBot/1.0")}), timeout=20) as response:  # noqa: S310
+            with urlopen(Request(image_url, headers=get_headers(image_url)), timeout=20) as response:  # noqa: S310
                 data = response.read()
                 content_type = response.headers.get_content_type() or "application/octet-stream"
         self.client.put_object(Bucket=self.bucket, Key=key, Body=data, ContentType=content_type)
@@ -251,7 +253,7 @@ class NewsCrawler:
                 return category, [str(t) for t in data.get("tags", [])][:20], truncate_words(data.get("summary", text), 200)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("News LLM classification failed for %s attempt=%s: %s", title, attempt + 1, exc)
-                await asyncio.sleep(2**attempt)
+                await asyncio.sleep(max(0.0, add_jitter(2**attempt)))
         return fallback_classify(f"{title}\n{text}")
 
     async def _fetch(self, url: str) -> dict[str, Any]:
@@ -262,7 +264,7 @@ class NewsCrawler:
         if url.startswith("file://"):
             html = Path(urlparse(url).path).read_text(encoding="utf-8")
             return {"html": html, "markdown": BeautifulSoup(html, "lxml").get_text("\n", strip=True)}
-        with urlopen(Request(url, headers={"User-Agent": os.getenv("CRAWLER_USER_AGENT", "CollegeCueBot/1.0")}), timeout=30) as response:  # noqa: S310
+        with urlopen(Request(url, headers=get_headers(url)), timeout=30) as response:  # noqa: S310
             html = response.read().decode(response.headers.get_content_charset() or "utf-8", errors="replace")
             return {"html": html, "markdown": BeautifulSoup(html, "lxml").get_text("\n", strip=True)}
 
@@ -298,7 +300,7 @@ class NewsCrawler:
         domain = urlparse(url).netloc or "file"
         elapsed = time.monotonic() - self._last_domain_fetch.get(domain, 0)
         if elapsed < self.rate_limit_seconds:
-            await asyncio.sleep(self.rate_limit_seconds - elapsed)
+            await asyncio.sleep(max(0.0, add_jitter(self.rate_limit_seconds - elapsed)))
         self._last_domain_fetch[domain] = time.monotonic()
 
     def _robots_allowed(self, url: str) -> bool:
@@ -308,7 +310,7 @@ class NewsCrawler:
         rp = robotparser.RobotFileParser(f"{parsed.scheme}://{parsed.netloc}/robots.txt")
         try:
             rp.read()
-            return rp.can_fetch(os.getenv("CRAWLER_USER_AGENT", "CollegeCueBot/1.0"), url)
+            return rp.can_fetch(get_random_ua(), url)
         except Exception:
             return True
 

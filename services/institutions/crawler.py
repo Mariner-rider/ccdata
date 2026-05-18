@@ -20,6 +20,8 @@ from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 
+from services.common.user_agents import add_jitter, get_headers, get_random_ua
+
 boto3 = importlib.import_module("boto3") if importlib.util.find_spec("boto3") else None
 BotoConfig = importlib.import_module("botocore.client").Config if importlib.util.find_spec("botocore") else None
 
@@ -181,7 +183,7 @@ class S3Store:
             data = Path(urlparse(image_url).path).read_bytes()
             ctype = "image/jpeg"
         else:
-            with urlopen(Request(image_url, headers={"User-Agent": "CollegeCueBot/1.0"}), timeout=20) as resp:  # noqa: S310
+            with urlopen(Request(image_url, headers=get_headers(image_url)), timeout=20) as resp:  # noqa: S310
                 data = resp.read()
                 ctype = resp.headers.get_content_type() or "application/octet-stream"
         return self.put_bytes(self.image_bucket, key, data, ctype)
@@ -258,7 +260,7 @@ class InstitutionCrawler:
             except Exception:
                 if attempt == max_retries - 1:
                     raise
-                await asyncio.sleep(base_delay * (2**attempt))
+                await asyncio.sleep(max(0.0, add_jitter(base_delay * (2**attempt))))
         raise RuntimeError("unreachable fetch retry state")
 
     async def _fetch_once(self, url: str) -> tuple[str, str]:
@@ -276,14 +278,14 @@ class InstitutionCrawler:
             parsed = urlparse(url)
             path = parsed.path or (parsed.netloc + parsed.path)
             return Path(path).read_text(encoding="utf-8"), ""
-        with urlopen(Request(url, headers={"User-Agent": os.getenv("CRAWLER_USER_AGENT", "CollegeCueBot/1.0")}), timeout=30) as resp:  # noqa: S310
+        with urlopen(Request(url, headers=get_headers(url)), timeout=30) as resp:  # noqa: S310
             return resp.read().decode(resp.headers.get_content_charset() or "utf-8", errors="replace"), ""
 
     async def _rate_limit(self, url: str) -> None:
         domain = urlparse(url).netloc or "file"
         elapsed = time.monotonic() - self._last_domain_fetch.get(domain, 0)
         if elapsed < self.rate_limit_seconds:
-            await asyncio.sleep(self.rate_limit_seconds - elapsed)
+            await asyncio.sleep(max(0.0, add_jitter(self.rate_limit_seconds - elapsed)))
         self._last_domain_fetch[domain] = time.monotonic()
 
     def _robots_allowed(self, url: str) -> bool:
@@ -294,7 +296,7 @@ class InstitutionCrawler:
         rp = robotparser.RobotFileParser(robots_url)
         try:
             rp.read()
-            return rp.can_fetch(os.getenv("CRAWLER_USER_AGENT", "CollegeCueBot/1.0"), url)
+            return rp.can_fetch(get_random_ua(), url)
         except Exception:
             LOGGER.warning("robots.txt check failed for %s; allowing crawl", url)
             return True
@@ -341,7 +343,7 @@ class InstitutionCrawler:
                 return json.loads(content)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("LLM extraction failed for %s attempt=%s: %s", page.url, attempt + 1, exc)
-                await asyncio.sleep(2**attempt)
+                await asyncio.sleep(max(0.0, add_jitter(2**attempt)))
         return None
 
     def _css_extract(self, page: CrawlPage, entity_type: str) -> dict[str, Any]:

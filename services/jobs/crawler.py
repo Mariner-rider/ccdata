@@ -20,6 +20,8 @@ from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 
+from services.common.user_agents import add_jitter, get_headers, get_random_ua
+
 LOGGER = logging.getLogger(__name__)
 
 if importlib.util.find_spec("crawl4ai"):
@@ -239,7 +241,7 @@ def validate_application_link(url: str) -> tuple[bool, bool]:
     if os.getenv("JOBS_VALIDATE_LINKS", "true").lower() == "false":
         return True, False
     try:
-        with urlopen(Request(url, headers={"User-Agent": os.getenv("CRAWLER_USER_AGENT", "CollegeCueBot/1.0")}), timeout=float(os.getenv("JOBS_LINK_TIMEOUT", "10"))) as response:  # noqa: S310
+        with urlopen(Request(url, headers=get_headers(url)), timeout=float(os.getenv("JOBS_LINK_TIMEOUT", "10"))) as response:  # noqa: S310
             body = response.read(12000).decode(response.headers.get_content_charset() or "utf-8", errors="replace")
             return 200 <= getattr(response, "status", 200) < 400, is_login_wall(body, url)
     except Exception as exc:  # noqa: BLE001
@@ -289,7 +291,7 @@ class PdfStore:
         if pdf_url.startswith("file://"):
             data = Path(urlparse(pdf_url).path).read_bytes()
         else:
-            with urlopen(Request(pdf_url, headers={"User-Agent": os.getenv("CRAWLER_USER_AGENT", "CollegeCueBot/1.0")}), timeout=30) as response:  # noqa: S310
+            with urlopen(Request(pdf_url, headers=get_headers(pdf_url)), timeout=30) as response:  # noqa: S310
                 data = response.read()
         self.client.put_object(Bucket=self.bucket, Key=key, Body=data, ContentType="application/pdf")
         return f"s3://{self.bucket}/{key}"
@@ -482,7 +484,7 @@ class JobsCrawler:
             except Exception:
                 if attempt == max_retries - 1:
                     raise
-                await asyncio.sleep(base_delay * (2**attempt))
+                await asyncio.sleep(max(0.0, add_jitter(base_delay * (2**attempt))))
         raise RuntimeError("unreachable fetch retry state")
 
     async def _fetch_once(self, url: str) -> str:
@@ -502,14 +504,14 @@ class JobsCrawler:
                 return html
         if url.startswith("file://"):
             return Path(urlparse(url).path).read_text(encoding="utf-8")
-        with urlopen(Request(url, headers={"User-Agent": os.getenv("CRAWLER_USER_AGENT", "CollegeCueBot/1.0")}), timeout=30) as response:  # noqa: S310
+        with urlopen(Request(url, headers=get_headers(url)), timeout=30) as response:  # noqa: S310
             return response.read().decode(response.headers.get_content_charset() or "utf-8", errors="replace")
 
     async def _rate_limit(self, url: str) -> None:
         domain = urlparse(url).netloc or "file"
         elapsed = time.monotonic() - self._last_domain_fetch.get(domain, 0)
         if elapsed < self.rate_limit_seconds:
-            await asyncio.sleep(self.rate_limit_seconds - elapsed)
+            await asyncio.sleep(max(0.0, add_jitter(self.rate_limit_seconds - elapsed)))
         self._last_domain_fetch[domain] = time.monotonic()
 
     def _robots_allowed(self, url: str) -> bool:
@@ -519,7 +521,7 @@ class JobsCrawler:
         rp = robotparser.RobotFileParser(f"{parsed.scheme}://{parsed.netloc}/robots.txt")
         try:
             rp.read()
-            return rp.can_fetch(os.getenv("CRAWLER_USER_AGENT", "CollegeCueBot/1.0"), url)
+            return rp.can_fetch(get_random_ua(), url)
         except Exception:
             return True
 

@@ -2,7 +2,9 @@ import os
 from importlib.util import find_spec
 
 if find_spec("fastapi") is not None:
-    from fastapi import FastAPI, Header, HTTPException
+    from fastapi import FastAPI, Header, HTTPException, Response
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import PlainTextResponse
 else:
 
     class HTTPException(Exception):
@@ -15,24 +17,45 @@ else:
         def __init__(self, *args, **kwargs):
             self.routes = []
 
-        def _route(self, method: str, path: str):
+        def _route(self, method: str, path: str, **_kwargs):
             def decorator(func):
                 self.routes.append({"method": method, "path": path, "endpoint": func})
                 return func
 
             return decorator
 
-        def get(self, path: str):
-            return self._route("GET", path)
+        def get(self, path: str, **kwargs):
+            return self._route("GET", path, **kwargs)
 
-        def post(self, path: str):
-            return self._route("POST", path)
+        def post(self, path: str, **kwargs):
+            return self._route("POST", path, **kwargs)
+
+        def add_middleware(self, *args, **kwargs):
+            return None
+
+        def middleware(self, middleware_type: str):
+            def decorator(func):
+                return func
+
+            return decorator
 
     def FastAPI(*args, **kwargs):
         return _FallbackFastAPI(*args, **kwargs)
 
     def Header(default=None):
         return default
+
+    class Response:
+        def __init__(self, content=None, media_type=None):
+            self.content = content
+            self.media_type = media_type
+            self.headers = {}
+
+    class PlainTextResponse(Response):
+        pass
+
+    class CORSMiddleware:
+        pass
 
 
 if find_spec("pydantic") is not None:
@@ -61,7 +84,6 @@ from services.lite_pipeline.main import (
     chatbot_sync,
     discover,
     enqueue_job,
-    export_entity,
     job_get,
     job_postings_get,
     job_postings_list,
@@ -86,6 +108,31 @@ from services.lite_pipeline.main import (
 
 app = FastAPI(title="collegecue-local-lite")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+PUBLIC_CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "PUBLIC_CORS_ORIGINS", "https://collegecue.com,https://www.collegecue.com"
+    ).split(",")
+    if origin.strip() and origin.strip() != "*"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=PUBLIC_CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "Idempotency-Key"],
+)
+
+
+@app.middleware("http")
+async def public_response_hardening(request, call_next):
+    response = await call_next(request)
+    for header in ("X-Powered-By", "Server", "X-Request-Id"):
+        response.headers.pop(header, None)
+    if request.url.path.startswith("/public/") or request.url.path == "/public/entities":
+        response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
 
 
 def _guard(key):
@@ -103,6 +150,11 @@ class SourceIn(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/robots.txt", response_class=PlainTextResponse)
+def robots_txt():
+    return "User-agent: *\nDisallow: /admin/\nDisallow: /internal/\nAllow: /public/\nAllow: /search\n"
 
 
 @app.post("/sources")
@@ -140,11 +192,6 @@ def crawl(
 ):
     _guard(x_api_key)
     return enqueue_job(id, "crawl", dry_run, 5, None, idempotency_key)
-
-
-@app.get("/records/{id}/export")
-def export(id: int):
-    return export_entity(id)
 
 
 @app.get("/review")
@@ -374,53 +421,4 @@ def research_detail(id: int):
     out = research_items_get(id)
     if not out:
         raise HTTPException(status_code=404, detail="not found")
-    return out
-
-
-@app.get('/admissions')
-def list_admissions(status:str|None=None,state:str|None=None,type:str|None=None,country:str|None=None,limit:int=100):
-    return {"results":admissions_list(status=status,state=state,admission_type=type,country=country,limit=limit)}
-
-@app.get('/admissions/upcoming')
-def upcoming_admissions(days:int=30):
-    return {"results":admissions_upcoming(days)}
-
-@app.get('/admissions/{id}')
-def admission_detail(id:int):
-    out=admissions_get(id)
-    if not out: raise HTTPException(status_code=404,detail='not found')
-    return out
-
-
-@app.get('/jobs/search')
-def search_jobs(q:str,limit:int=100):
-    return {"results":job_postings_search(q,limit)}
-
-@app.get('/jobs/internships')
-def internships(stipend_min:int|None=None,location:str|None=None,status:str|None=None,limit:int=100):
-    return {"results":job_postings_list(job_type='internship',location=location,stipend_min=stipend_min,status=status,limit=limit)}
-
-@app.get('/jobs')
-def list_job_postings(type:str|None=None,category:str|None=None,state:str|None=None,status:str|None=None,location:str|None=None,limit:int=100):
-    return {"results":job_postings_list(job_type=type,category=category,state=state,status=status,location=location,limit=limit)}
-
-@app.get('/jobs/{id}')
-def job_posting_detail(id:int):
-    out=job_postings_get(id)
-    if not out: raise HTTPException(status_code=404,detail='not found')
-    return out
-
-
-@app.get('/news/featured')
-def featured_news(limit:int=100):
-    return {"results":news_articles_featured(limit)}
-
-@app.get('/news')
-def list_news(category:str|None=None,days:int|None=None,entity_id:int|None=None,limit:int=100):
-    return {"results":news_articles_list(category=category,days=days,entity_id=entity_id,limit=limit)}
-
-@app.get('/news/{id}')
-def news_detail(id:int):
-    out=news_articles_get(id)
-    if not out: raise HTTPException(status_code=404,detail='not found')
     return out

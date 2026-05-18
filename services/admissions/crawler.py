@@ -19,6 +19,8 @@ from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 
+from services.common.user_agents import add_jitter, get_headers, get_random_ua
+
 LOGGER = logging.getLogger(__name__)
 
 if importlib.util.find_spec("crawl4ai"):
@@ -197,7 +199,7 @@ def validate_application_link(url: str) -> bool:
     if os.getenv("ADMISSIONS_VALIDATE_LINKS", "true").lower() == "false":
         return True
     try:
-        request = Request(url, headers={"User-Agent": os.getenv("CRAWLER_USER_AGENT", "CollegeCueBot/1.0")})
+        request = Request(url, headers=get_headers(url))
         with urlopen(request, timeout=float(os.getenv("ADMISSIONS_LINK_TIMEOUT", "10"))) as response:  # noqa: S310
             return 200 <= getattr(response, "status", 200) < 400
     except Exception as exc:  # noqa: BLE001
@@ -352,7 +354,7 @@ class AdmissionsCrawler:
             except Exception:
                 if attempt == max_retries - 1:
                     raise
-                await asyncio.sleep(base_delay * (2**attempt))
+                await asyncio.sleep(max(0.0, add_jitter(base_delay * (2**attempt))))
         raise RuntimeError("unreachable fetch retry state")
 
     async def _fetch_once(self, url: str) -> str:
@@ -372,14 +374,14 @@ class AdmissionsCrawler:
                 return html
         if url.startswith("file://"):
             return Path(urlparse(url).path).read_text(encoding="utf-8")
-        with urlopen(Request(url, headers={"User-Agent": os.getenv("CRAWLER_USER_AGENT", "CollegeCueBot/1.0")}), timeout=30) as response:  # noqa: S310
+        with urlopen(Request(url, headers=get_headers(url)), timeout=30) as response:  # noqa: S310
             return response.read().decode(response.headers.get_content_charset() or "utf-8", errors="replace")
 
     async def _rate_limit(self, url: str) -> None:
         domain = urlparse(url).netloc or "file"
         elapsed = time.monotonic() - self._last_domain_fetch.get(domain, 0)
         if elapsed < self.rate_limit_seconds:
-            await asyncio.sleep(self.rate_limit_seconds - elapsed)
+            await asyncio.sleep(max(0.0, add_jitter(self.rate_limit_seconds - elapsed)))
         self._last_domain_fetch[domain] = time.monotonic()
 
     def _robots_allowed(self, url: str) -> bool:
@@ -389,7 +391,7 @@ class AdmissionsCrawler:
         rp = robotparser.RobotFileParser(f"{parsed.scheme}://{parsed.netloc}/robots.txt")
         try:
             rp.read()
-            return rp.can_fetch(os.getenv("CRAWLER_USER_AGENT", "CollegeCueBot/1.0"), url)
+            return rp.can_fetch(get_random_ua(), url)
         except Exception:
             return True
 
