@@ -375,3 +375,52 @@ def research_detail(id: int):
     if not out:
         raise HTTPException(status_code=404, detail="not found")
     return out
+
+
+@app.get('/admissions')
+def list_admissions(status:str|None=None,state:str|None=None,type:str|None=None,country:str|None=None,limit:int=100):
+    return {"results":admissions_list(status=status,state=state,admission_type=type,country=country,limit=limit)}
+
+@app.get('/admissions/upcoming')
+def upcoming_admissions(days:int=30):
+    return {"results":admissions_upcoming(days)}
+
+@app.get('/admissions/{id}')
+def admission_detail(id:int):
+    out=admissions_get(id)
+    if not out: raise HTTPException(status_code=404,detail='not found')
+    return out
+
+
+@app.get('/jobs/search')
+def search_jobs(q:str,limit:int=100):
+    return {"results":job_postings_search(q,limit)}
+
+@app.get('/jobs/internships')
+def internships(stipend_min:int|None=None,location:str|None=None,status:str|None=None,limit:int=100):
+    return {"results":job_postings_list(job_type='internship',location=location,stipend_min=stipend_min,status=status,limit=limit)}
+
+@app.get('/jobs')
+def list_job_postings(type:str|None=None,category:str|None=None,state:str|None=None,status:str|None=None,location:str|None=None,limit:int=100):
+    return {"results":job_postings_list(job_type=type,category=category,state=state,status=status,location=location,limit=limit)}
+
+@app.get('/jobs/{id}')
+def job_posting_detail(id:int):
+    out=job_postings_get(id)
+    if not out: raise HTTPException(status_code=404,detail='not found')
+    return out
+
+
+@app.get('/news/featured')
+def featured_news(limit:int=100):
+    return {"results":news_articles_featured(limit)}
+
+@app.get('/news')
+def list_news(category:str|None=None,days:int|None=None,entity_id:int|None=None,limit:int=100):
+    return {"results":news_articles_list(category=category,days=days,entity_id=entity_id,limit=limit)}
+
+@app.get('/news/{id}')
+def news_detail(id:int):
+    out=news_articles_get(id)
+    if not out: raise HTTPException(status_code=404,detail='not found')
+    return out
