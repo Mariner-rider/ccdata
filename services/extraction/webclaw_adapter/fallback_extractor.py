@@ -4,6 +4,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
 
+from services.common.user_agents import get_headers
+
 try:
     import httpx
 except Exception:
@@ -29,7 +31,7 @@ def _read_url_text(url: str, timeout: float) -> str:
         u=urlparse(url); fp = Path((u.netloc + u.path) if u.netloc else u.path); return fp.read_text(encoding="utf-8")
     if httpx is None: raise RuntimeError("httpx is required for non-file URLs")
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-        r = client.get(url); r.raise_for_status(); return r.text
+        r = client.get(url, headers=get_headers(url)); r.raise_for_status(); return r.text
 
 def _pick_line(lines, keys):
     for l in lines:

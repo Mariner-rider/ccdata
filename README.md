@@ -162,7 +162,7 @@ Commands:
 Use `LOG_FORMAT=json` for structured operational logs.
 
 ## Phase 18 Robustness & Search
-- HTTP resilience: retries/backoff/jitter with status handling (403 blocked, 429 cooldown, 5xx retry) via `CRAWL_MAX_RETRIES`, `CRAWL_BACKOFF_BASE_SECONDS`, `CRAWL_USER_AGENTS`.
+- HTTP resilience: retries/backoff/jitter with status handling (403 blocked, 429 cooldown, 5xx retry) via `CRAWL_MAX_RETRIES`, `CRAWL_BACKOFF_BASE_SECONDS`, and the shared browser header rotation in `services.common.user_agents`.
 - Optional proxy rotation via `HTTP_PROXY_LIST` with graceful fallback.
 - Cross-source dedup with `canonical_entity_id` and duplicate flagging.
 - Delta tracking through `change_log` on record updates.

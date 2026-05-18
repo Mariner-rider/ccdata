@@ -29,8 +29,7 @@ class Settings:
     s3_endpoint_url: str = _env("S3_ENDPOINT_URL", "http://minio:9000")
     s3_bucket: str = _env("S3_BUCKET", "raw-html")
     s3_access_key: str = _env("S3_ACCESS_KEY", "minio")
-    s3_secret_key: str = _env("S3_SECRET_KEY", "minio123")
-    crawler_user_agent: str = _env("CRAWLER_USER_AGENT", "ccdata-distributed-crawler/1.0")
+    s3_secret_key: str = _env("S3_SECRET_KEY", os.getenv("MINIO_ROOT_PASSWORD", ""))
     per_domain_delay_seconds: float = float(_env("PER_DOMAIN_DELAY_SECONDS", "1.0"))
     max_depth: int = int(_env("MAX_DEPTH", "2"))
 
