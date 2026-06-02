@@ -11,6 +11,11 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
+    environment:
+      CRAWL_MAX_PAGES_PER_SOURCE: ${CRAWL_MAX_PAGES_PER_SOURCE:-40}
+      CRAWL_RATE_LIMIT_SECONDS: ${CRAWL_RATE_LIMIT_SECONDS:-1.5}
+      CRAWL_TIMEOUT_SECONDS: ${CRAWL_TIMEOUT_SECONDS:-30}
+      CRAWL_MAX_RETRIES: ${CRAWL_MAX_RETRIES:-3}
   core-api:
     build:
       context: .
