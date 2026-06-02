@@ -1,27 +1,181 @@
 version: '3.9'
+
 services:
   postgres:
-    image: postgres:16
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: crawler
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: crawler
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crawler -d crawler"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 2g
+    networks:
+      - collegecue_net
+
   redis:
-    image: redis:7
-  object-storage:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 512m
+    networks:
+      - collegecue_net
+
+  minio:
     image: minio/minio:latest
-    command: server /data
-  queue-worker:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.worker
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    mem_limit: 1g
+    networks:
+      - collegecue_net
+
+  createbucket:
+    image: minio/mc:latest
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD} &&
+                  mc mb --ignore-existing local/collegecue-data"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}
+    networks:
+      - collegecue_net
+
   core-api:
     build:
       context: .
       dockerfile: docker/Dockerfile.core
-  browser-worker:
+    restart: unless-stopped
+    command: uvicorn services.lite_pipeline.api:app --host 0.0.0.0 --port 8000 --workers 2
+    environment:
+      POSTGRES_DSN: postgresql://crawler:${POSTGRES_PASSWORD:?}@postgres:5432/crawler
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}
+      SERVICE_API_KEY: ${SERVICE_API_KEY:?SERVICE_API_KEY must be set}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      API_RATE_LIMIT_PER_MINUTE: ${API_RATE_LIMIT_PER_MINUTE:-120}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    mem_limit: 2g
+    networks:
+      - collegecue_net
+
+  worker:
     build:
       context: .
-      dockerfile: docker/Dockerfile.browser-worker
-    deploy:
-      replicas: 2
-  search:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.2
-  metrics:
-    image: prom/prometheus:latest
+      dockerfile: docker/Dockerfile.worker
+    restart: unless-stopped
+    command: python -m services.lite_pipeline.main worker:run
+    environment:
+      POSTGRES_DSN: postgresql://crawler:${POSTGRES_PASSWORD:?}@postgres:5432/crawler
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}
+      SERVICE_API_KEY: ${SERVICE_API_KEY:?SERVICE_API_KEY must be set}
+      CRAWL_MAX_PAGES_PER_SOURCE: ${CRAWL_MAX_PAGES_PER_SOURCE:-40}
+      CRAWL_RATE_LIMIT_SECONDS: ${CRAWL_RATE_LIMIT_SECONDS:-1.5}
+      CRAWL_TIMEOUT_SECONDS: ${CRAWL_TIMEOUT_SECONDS:-30}
+      CRAWL_MAX_RETRIES: ${CRAWL_MAX_RETRIES:-3}
+      CRAWL_BACKOFF_BASE_SECONDS: ${CRAWL_BACKOFF_BASE_SECONDS:-2}
+      DAILY_MAX_JOBS: ${DAILY_MAX_JOBS:-500}
+      DAILY_MAX_JOBS_PER_DOMAIN: ${DAILY_MAX_JOBS_PER_DOMAIN:-20}
+      HTTP_PROXY_LIST: ${HTTP_PROXY_LIST:-}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    mem_limit: 2g
+    networks:
+      - collegecue_net
+
+  airflow-init:
+    image: apache/airflow:2.9.1
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://crawler:${POSTGRES_PASSWORD:?}@postgres:5432/crawler
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?AIRFLOW_FERNET_KEY must be set}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_FERNET_KEY:?AIRFLOW_FERNET_KEY must be set}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?AIRFLOW_ADMIN_PASSWORD must be set}
+    command: >
+      bash -c "airflow db init &&
+               airflow users create --username admin
+               --password $${_AIRFLOW_WWW_USER_PASSWORD}
+               --firstname Admin --lastname User
+               --role Admin --email admin@collegecue.com"
+    networks:
+      - collegecue_net
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.1
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://crawler:${POSTGRES_PASSWORD:?}@postgres:5432/crawler
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?AIRFLOW_FERNET_KEY must be set}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_FERNET_KEY:?AIRFLOW_FERNET_KEY must be set}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?AIRFLOW_ADMIN_PASSWORD must be set}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+    command: airflow scheduler
+    mem_limit: 1g
+    networks:
+      - collegecue_net
+
+volumes:
+  pgdata:
+  minio_data:
+
+networks:
+  collegecue_net:

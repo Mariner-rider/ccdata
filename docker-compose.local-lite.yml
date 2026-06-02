@@ -1,4 +1,5 @@
 version: '3.9'
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -32,13 +33,11 @@ services:
       dockerfile: docker/Dockerfile.core
     command: uvicorn services.lite_pipeline.api:app --host 0.0.0.0 --port 8000
     environment:
-      POSTGRES_DSN: postgresql://crawler:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/crawler
+      POSTGRES_DSN: postgresql://crawler:${POSTGRES_PASSWORD:?}@postgres:5432/crawler
       REDIS_URL: redis://redis:6379/0
-      WEBCLAW_ENABLED: "true"
-      WEBCLAW_BASE_URL: ${WEBCLAW_BASE_URL:-}
-      DEBUG_RAW_HTML: "false"
-      RAW_HTML_RETENTION_DAYS: 7
       SERVICE_API_KEY: ${SERVICE_API_KEY:?SERVICE_API_KEY must be set}
+      DEBUG_RAW_HTML: "false"
+      RAW_HTML_RETENTION_DAYS: "7"
     depends_on:
       postgres:
         condition: service_healthy
@@ -57,13 +56,13 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
-    command: python -m services.lite_pipeline.main crawl:missing-fields
+    command: python -m services.lite_pipeline.main worker:run
     environment:
-      POSTGRES_DSN: postgresql://crawler:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/crawler
+      POSTGRES_DSN: postgresql://crawler:${POSTGRES_PASSWORD:?}@postgres:5432/crawler
       REDIS_URL: redis://redis:6379/0
-      WEBCLAW_ENABLED: "true"
-      WEBCLAW_BASE_URL: ${WEBCLAW_BASE_URL:-}
       SERVICE_API_KEY: ${SERVICE_API_KEY:?SERVICE_API_KEY must be set}
+      CRAWL_MAX_PAGES_PER_SOURCE: ${CRAWL_MAX_PAGES_PER_SOURCE:-10}
+      CRAWL_RATE_LIMIT_SECONDS: ${CRAWL_RATE_LIMIT_SECONDS:-1.0}
     depends_on:
       postgres:
         condition: service_healthy

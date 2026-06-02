@@ -12,6 +12,6 @@ steps=[([sys.executable,"-m","services.lite_pipeline.main","init-db"],"init-db")
 for cmd,label in steps:
     c,o=run(cmd); r.append(f"{label}: {c}")
 c,o=run([sys.executable,"-m","pytest","-q"]); r.append(f"pytest: {c}")
-Path('docs').mkdir(exist_ok=True); Path('docs/no-docker-verification-report.md').write_text('\n'.join(['# No-Docker Verification Report',*r]))
+Path('no-docker-verification-report.md').write_text('\n'.join(['# No-Docker Verification Report',*r]))
 print('\n'.join(r))
 if c!=0: raise SystemExit(1)

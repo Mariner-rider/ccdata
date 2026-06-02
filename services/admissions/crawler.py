@@ -652,3 +652,28 @@ ON CONFLICT(entity_id, program_name, intake_year) DO UPDATE SET
     raw_payload=EXCLUDED.raw_payload,
     updated_at=NOW()
 """
+
+# Authoritative simple API compatibility requested by production reset.
+_ADMISSIONS_CRAWL_SOURCE_IMPL = AdmissionsCrawler.crawl_source
+
+
+async def _admissions_crawl_source_compat(self, url: str | None = None, *args, **kwargs):
+    if url is not None and not kwargs:
+        return await _ADMISSIONS_CRAWL_SOURCE_IMPL(self, entity_id=None, entity_name="", source_url=url, intake_year=None)
+    return await _ADMISSIONS_CRAWL_SOURCE_IMPL(self, *args, **kwargs)
+
+
+async def _admissions_crawl_all(self):
+    sources = [
+        "https://nta.ac.in",
+        "https://www.shiksha.com/news",
+        "https://news.careers360.com",
+    ]
+    out = []
+    for source in sources:
+        out.extend(await _ADMISSIONS_CRAWL_SOURCE_IMPL(self, entity_id=None, entity_name="", source_url=source, intake_year=None))
+    return out
+
+
+AdmissionsCrawler.crawl_source = _admissions_crawl_source_compat
+AdmissionsCrawler.crawl_all = _admissions_crawl_all
