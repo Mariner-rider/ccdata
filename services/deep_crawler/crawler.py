@@ -14,7 +14,9 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
+from urllib import robotparser
 from urllib.parse import urljoin, urlparse
 
 try:
@@ -35,21 +37,26 @@ except ImportError:  # pragma: no cover - exercised when optional extra is absen
 
 
 PRIORITY_PATHS = [
-    "/about", "/about-us", "/overview", "/about-the-institute",
-    "/about-college", "/about-university", "/history",
-    "/courses", "/programmes", "/programs", "/academics",
-    "/departments", "/schools", "/faculties",
-    "/fee-structure", "/fees", "/fee", "/tuition",
-    "/faculty", "/faculty-members", "/people", "/staff",
-    "/directory", "/our-faculty",
-    "/hostel", "/accommodation", "/campus-life", "/residential",
-    "/placement", "/placements", "/career", "/career-development",
-    "/training-placement", "/campus-placement",
-    "/admissions", "/admission", "/apply", "/how-to-apply",
-    "/contact", "/contact-us", "/reach-us", "/location",
-    "/rankings", "/achievements", "/accreditation", "/recognition",
-    "/gallery", "/campus", "/infrastructure", "/facilities",
-    "/news", "/events", "/announcements",
+    "/about",
+    "/about-us",
+    "/courses",
+    "/programmes",
+    "/programs",
+    "/academics",
+    "/departments",
+    "/fee-structure",
+    "/fees",
+    "/faculty",
+    "/people",
+    "/hostel",
+    "/accommodation",
+    "/placement",
+    "/placements",
+    "/admissions",
+    "/contact",
+    "/rankings",
+    "/accreditation",
+    "/gallery",
 ]
 
 SKIP_PATH_PATTERNS = [
@@ -90,9 +97,10 @@ class DeepCrawler:
         js_required = await self._detect_js_required(self._base_url)
         pages = []
         for url in self._build_url_list(self._base_url):
-            if self._skip_url(url):
+            if self._skip_url(url) or not self._robots_allowed(url):
                 continue
-            await asyncio.sleep(add_jitter(self.rate_limit_seconds))
+            if not url.startswith("file://"):
+                await asyncio.sleep(add_jitter(self.rate_limit_seconds))
             html = await (self._fetch_page_playwright(url) if js_required else self._fetch_page_httpx(url))
             if not html or not self._is_useful_page(html):
                 continue
@@ -109,6 +117,8 @@ class DeepCrawler:
 
     async def _detect_js_required(self, url: str) -> bool:
         """Return True when static HTML appears too sparse or framework-rendered."""
+        if url.startswith("file://"):
+            return False
         if httpx is None:
             return CRAWL4AI_AVAILABLE
         try:
@@ -132,20 +142,30 @@ class DeepCrawler:
         parsed = urlparse(base_url)
         root = f"{parsed.scheme}://{parsed.netloc}"
         ordered = [base_url]
-        ordered.extend(urljoin(root, path) for path in PRIORITY_PATHS)
+        if not base_url.startswith("file://"):
+            ordered.extend(urljoin(root, path) for path in PRIORITY_PATHS)
         discovered: list[str] = []
-        try:
-            if httpx is None:
-                raise RuntimeError("httpx is required for link discovery")
-            response = httpx.get(base_url, headers=get_headers(base_url), timeout=self.timeout_seconds, follow_redirects=True)
-            if response.status_code < 400:
-                soup = BeautifulSoup(response.text, "html.parser")
+        if base_url.startswith("file://"):
+            try:
+                path = self._file_path_from_url(base_url)
+                soup = BeautifulSoup(path.read_text(encoding="utf-8"), "html.parser")
                 for anchor in soup.find_all("a", href=True):
-                    href = urljoin(base_url, anchor["href"]).split("#", 1)[0]
-                    if href and not self._skip_url(href):
-                        discovered.append(href)
-        except Exception:
-            discovered = []
+                    discovered.append(urljoin(base_url, anchor["href"]).split("#", 1)[0])
+            except Exception:
+                discovered = []
+        else:
+            try:
+                if httpx is None:
+                    raise RuntimeError("httpx is required for link discovery")
+                response = httpx.get(base_url, headers=get_headers(base_url), timeout=self.timeout_seconds, follow_redirects=True)
+                if response.status_code < 400:
+                    soup = BeautifulSoup(response.text, "html.parser")
+                    for anchor in soup.find_all("a", href=True):
+                        href = urljoin(base_url, anchor["href"]).split("#", 1)[0]
+                        if href and not self._skip_url(href):
+                            discovered.append(href)
+            except Exception:
+                discovered = []
         ordered.extend(discovered)
         seen = set()
         result = []
@@ -161,6 +181,12 @@ class DeepCrawler:
 
     async def _fetch_page_httpx(self, url: str) -> Optional[str]:
         """Fetch a URL with httpx, professional headers, and retry policy."""
+        if url.startswith("file://"):
+            try:
+                return self._file_path_from_url(url).read_text(encoding="utf-8")
+            except Exception as exc:
+                print(f"warning: failed to read {url}: {exc}")
+                return None
         if httpx is None:
             return None
         async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
@@ -329,8 +355,28 @@ class DeepCrawler:
         path = parsed.path.lower()
         return any(re.search(pattern, path, re.I) for pattern in SKIP_PATH_PATTERNS)
 
+    def _robots_allowed(self, url: str) -> bool:
+        """Return whether robots.txt allows fetching the URL."""
+        parsed = urlparse(url)
+        if self._base_netloc and parsed.netloc and parsed.netloc.lower() != self._base_netloc:
+            return True
+        try:
+            robots = robotparser.RobotFileParser(f"{parsed.scheme}://{parsed.netloc}/robots.txt")
+            robots.read()
+            return robots.can_fetch("*", url)
+        except Exception:
+            return True
+
+    @staticmethod
+    def _file_path_from_url(url: str) -> Path:
+        parsed = urlparse(url)
+        raw_path = (parsed.netloc + parsed.path) if parsed.netloc else parsed.path
+        return Path(raw_path.lstrip("/"))
+
     @staticmethod
     def _normalise_url(url: str) -> str:
+        if url.startswith("file://"):
+            return url
         if not url.startswith(("http://", "https://")):
             return f"https://{url}"
         return url

@@ -706,3 +706,20 @@ def crawl_research_sync(database_url: str, *, queries: list[str] | None = None, 
     items = asyncio.run(ResearchCrawler().crawl(queries=queries, seed_urls=seed_urls or [], include_arxiv=include_arxiv, repository=repository))
     saved = repository.upsert_many(items)
     return {"discovered": len(items), "saved": saved}
+
+# Authoritative simple API compatibility requested by production reset.
+async def _research_crawl_arxiv(self, category: str, max_results: int = 100):
+    return self.fetch_arxiv_bulk(categories=(category,), max_results=max_results)
+
+
+async def _research_crawl_shodhganga(self):
+    return await self.crawl(seed_urls=["https://shodhganga.inflibnet.ac.in"], include_arxiv=False)
+
+
+async def _research_crawl_all(self):
+    return await self.crawl(seed_urls=["https://shodhganga.inflibnet.ac.in", "https://irins.org"], include_arxiv=True)
+
+
+ResearchCrawler.crawl_arxiv = _research_crawl_arxiv
+ResearchCrawler.crawl_shodhganga = _research_crawl_shodhganga
+ResearchCrawler.crawl_all = _research_crawl_all

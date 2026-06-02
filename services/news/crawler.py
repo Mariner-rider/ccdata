@@ -576,3 +576,24 @@ def crawl_news_sync(database_url: str, *, sources: list[str] | None = None) -> d
     articles = asyncio.run(NewsCrawler().crawl(sources=sources, repository=repository))
     saved = repository.upsert_many(articles)
     return {"discovered": len(articles), "saved": saved}
+
+# Authoritative simple API compatibility requested by production reset.
+async def _news_crawl_source(self, url: str):
+    return await self.crawl(sources=[url])
+
+
+async def _news_crawl_all(self):
+    return await self.crawl(
+        sources=[
+            "https://timesofindia.indiatimes.com/education",
+            "https://www.ndtv.com/education",
+            "https://news.careers360.com",
+            "https://www.shiksha.com/news",
+            "https://www.ugc.gov.in/news",
+            "https://www.aicte-india.org",
+        ]
+    )
+
+
+NewsCrawler.crawl_source = _news_crawl_source
+NewsCrawler.crawl_all = _news_crawl_all

@@ -1,4 +1,4 @@
-from services.extraction.webclaw_adapter.fallback_extractor import extract_fallback
+from services.extraction.html_fallback_extractor import extract_fallback
 
 
 def test_fixture_college_extraction():

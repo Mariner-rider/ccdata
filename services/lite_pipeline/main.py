@@ -14,6 +14,9 @@ from services.jobs.crawler import JobsRepository, SQLITE_CREATE_JOBS, crawl_jobs
 from services.news.crawler import NewsRepository, SQLITE_CREATE_INSTITUTIONS, SQLITE_CREATE_NEWS, crawl_news_sync
 from services.research.crawler import ResearchRepository, SQLITE_CREATE_RESEARCH, crawl_research_sync
 from services.deep_crawler.crawler import CRAWL4AI_AVAILABLE, PRIORITY_PATHS, DeepCrawler, crawl_institution
+from services.test_series.crawler import QuestionCrawler
+from services.test_series.models import TestSeries
+from services.test_series.repository import QuestionRepository, TestSeriesRepository
 try:
     import psycopg
 except Exception:
@@ -424,7 +427,37 @@ def deep_crawl_all(max_pages=None, dry_run=False):
 
 
 def crawl_source(id,dry=False):
-    return deep_crawl_source(id, max_pages=int(os.getenv("CRAWL_MAX_PAGES_PER_SOURCE", "40")), dry_run=dry)
+    cfg=_cfg(); repo=Repo(cfg.database_url); repo.init(); sid,etype,name,url,trust=repo.get_source(id)
+    if not str(url).startswith("file://"):
+        return deep_crawl_source(id, max_pages=int(os.getenv("CRAWL_MAX_PAGES_PER_SOURCE", "40")), dry_run=dry)
+    plan=discover(url,cfg,repo); pages=[]
+    for p in plan:
+        if not p['robots_allowed']:
+            repo.log(p['url'],'blocked','robots'); continue
+        try:
+            pages.append({"url":p['url'],"extract":_fetch_extract_resilient(p['url'], timeout=cfg.timeout),"page_type":p['page_type']})
+        except Exception as e:
+            m=str(e)
+            if 'blocked:403' in m: repo.log(p['url'],'blocked','403')
+            elif 'cooldown:429' in m: repo.log(p['url'],'cooldown','429')
+            else: repo.log(p['url'],'error',m)
+    rec=merge_pages(etype,name,url,pages,trust); rec['source_id']=sid; rec['canonical_entity_id']=_canonical_sig(rec)
+    with sqlite3.connect(repo.path) as c:
+        dup=c.execute('select id from crawler_records where canonical_entity_id=? and source_id!=? limit 1',(rec['canonical_entity_id'],sid)).fetchone()
+    if dup: rec['duplicate_of']=dup[0]
+    req=REQ_BY_TYPE.get(etype,REQ_COLLEGE)
+    if etype=='college':
+        valid=rec['confidence_score']>=0.65 and (1-len(rec['missing_fields'])/max(1,len(req)))>=0.7 and rec['trust_tier'] in TRUST and rec['content_hash']
+    else:
+        valid=bool(rec.get('content_hash')) and rec['trust_tier'] in TRUST
+    qr=quality_report(plan,pages,rec,'pass' if valid else 'fail','quality_gate_failed' if not valid else '')
+    if dry: return {"dry_run":True,"quality_report":qr,"record":rec}
+    st=repo.save_entity(rec) if valid else (repo.save_quarantine(url,rec,'quality_gate_failed') or 'quarantined')
+    if st in {'created','updated','unchanged'}:
+        with sqlite3.connect(repo.path) as c:
+            c.execute('UPDATE source_registry SET last_crawled_at=?,updated_at=? WHERE id=?',(datetime.now(timezone.utc).isoformat(),datetime.now(timezone.utc).isoformat(),sid)); c.commit()
+    return {"source_id":sid,"status":st,"quality_report":qr}
+
 
 
 def preview_source(source_id):
@@ -800,12 +833,16 @@ def jobs_cancel(i):
 def worker_once():
     repo=Repo(_cfg().database_url); repo.init()
     with sqlite3.connect(repo.path) as c:
-        r=c.execute("SELECT id,source_id,dry_run,retry_count FROM crawl_jobs WHERE status='queued' AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY priority DESC,id ASC LIMIT 1",(datetime.now(timezone.utc).isoformat(),)).fetchone()
+        r=c.execute("SELECT id,source_id,dry_run,retry_count,job_type,payload_json FROM crawl_jobs WHERE status='queued' AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY priority DESC,id ASC LIMIT 1",(datetime.now(timezone.utc).isoformat(),)).fetchone()
         if not r: return {'processed':0}
-        jid,sid,dry,retry_count=r
+        jid,sid,dry,retry_count,job_type,payload_json=r
         c.execute("UPDATE crawl_jobs SET status='running',started_at=? WHERE id=?",(datetime.now(timezone.utc).isoformat(),jid)); c.commit()
     try:
-        result=crawl_source(sid,bool(dry))
+        if job_type == 'question_crawl':
+            payload = json.loads(payload_json or '{}')
+            result = asyncio.run(_test_crawl_async(payload.get('exam_type')))
+        else:
+            result=crawl_source(sid,bool(dry))
         with sqlite3.connect(repo.path) as c:
             c.execute("UPDATE crawl_jobs SET status='completed',result_json=?,completed_at=? WHERE id=?",(json.dumps(result),datetime.now(timezone.utc).isoformat(),jid)); c.commit()
         _log_event('crawl_job_completed',job_id=jid,source_id=sid)
@@ -975,6 +1012,83 @@ def integrity_repair(apply=False):
         if apply: c.commit()
     return {'dry_run':not apply,'changes':changes}
 
+
+async def _test_crawl_async(exam_type):
+    results = await QuestionCrawler().crawl_all_sources(exam_type)
+    total = sum(results.values())
+    return {"exam_type": exam_type, "added": total, "by_site": results}
+
+
+def test_crawl(exam_type):
+    result = asyncio.run(_test_crawl_async(exam_type))
+    print(f"Added {result['added']} questions for {exam_type}")
+    return result
+
+
+async def _test_create_async(name, exam_type, duration, easy, medium, hard):
+    q_repo = QuestionRepository()
+    t_repo = TestSeriesRepository()
+    mix = {"easy": easy, "medium": medium, "hard": hard}
+    questions = await q_repo.get_for_test(exam_type, mix, [])
+    test_id = await t_repo.create(TestSeries(None, name, exam_type, "", len(questions), duration, "admin", True, None))
+    await t_repo.add_questions(test_id, [q.id for q in questions if q.id])
+    return {"test_id": test_id, "questions": len(questions)}
+
+
+def test_create(name, exam_type, duration, easy, medium, hard):
+    result = asyncio.run(_test_create_async(name, exam_type, duration, easy, medium, hard))
+    print(f"Created test series ID: {result['test_id']} with {result['questions']} questions")
+    return result
+
+
+async def _test_list_async():
+    return [test.__dict__ for test in await TestSeriesRepository().list_active()]
+
+
+def test_list():
+    return asyncio.run(_test_list_async())
+
+
+async def _test_stats_async():
+    repo = QuestionRepository()
+    async with await repo._connect() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT COUNT(*) AS count FROM question_bank")
+            total = (await cur.fetchone())["count"]
+            await cur.execute("SELECT exam_type, COUNT(*) AS count FROM question_bank GROUP BY exam_type ORDER BY exam_type")
+            by_exam = {row["exam_type"]: int(row["count"]) for row in await cur.fetchall()}
+            await cur.execute("SELECT difficulty, COUNT(*) AS count FROM question_bank GROUP BY difficulty ORDER BY difficulty")
+            by_difficulty = {row["difficulty"]: int(row["count"]) for row in await cur.fetchall()}
+            await cur.execute("SELECT COUNT(*) AS count FROM question_bank WHERE is_verified = FALSE")
+            unverified = (await cur.fetchone())["count"]
+    return {"total": int(total), "by_exam": by_exam, "by_difficulty": by_difficulty, "unverified": int(unverified)}
+
+
+def test_stats():
+    stats = asyncio.run(_test_stats_async())
+    print(f"Total questions: {stats['total']}")
+    print("By exam: " + ", ".join(f"{exam}: {count}" for exam, count in stats["by_exam"].items()))
+    print("By difficulty: " + ", ".join(f"{difficulty}: {count}" for difficulty, count in stats["by_difficulty"].items()))
+    print(f"Unverified: {stats['unverified']}")
+    return stats
+
+
+async def _practice_test_async(exam, difficulty, count):
+    questions = await QuestionRepository().get_practice_questions(exam, None, difficulty, count, [])
+    return [q.__dict__ for q in questions]
+
+
+def practice_test(exam, difficulty, count):
+    questions = asyncio.run(_practice_test_async(exam, difficulty, count))
+    for index, question in enumerate(questions, start=1):
+        print(f"{index}. {question['question_text']}")
+        print(f"  a) {question['option_a']}")
+        print(f"  b) {question['option_b']}")
+        print(f"  c) {question['option_c']}")
+        print(f"  d) {question['option_d']}")
+    return questions
+
+
 def main():
     pa=argparse.ArgumentParser(); sub=pa.add_subparsers(dest='cmd',required=True)
     sub.add_parser('init-db')
@@ -1043,6 +1157,11 @@ def main():
     rsg=sub.add_parser('research:get'); rsg.add_argument('--id',type=int,required=True)
     rss=sub.add_parser('research:search'); rss.add_argument('--q',required=True); rss.add_argument('--limit',type=int,default=100)
     rsc=sub.add_parser('research:crawl'); rsc.add_argument('--query',default=None); rsc.add_argument('--seed-url',default=None); rsc.add_argument('--no-arxiv',action='store_true')
+    tc=sub.add_parser('test:crawl'); tc.add_argument('--exam-type',required=True)
+    tcr=sub.add_parser('test:create'); tcr.add_argument('--name',required=True); tcr.add_argument('--exam-type',required=True); tcr.add_argument('--duration',type=int,default=60); tcr.add_argument('--easy',type=int,default=0); tcr.add_argument('--medium',type=int,default=0); tcr.add_argument('--hard',type=int,default=0)
+    sub.add_parser('test:list')
+    sub.add_parser('test:stats')
+    pt=sub.add_parser('practice:test'); pt.add_argument('--exam',required=True); pt.add_argument('--difficulty',required=True); pt.add_argument('--count',type=int,default=10)
     args=pa.parse_args(); repo=Repo(_cfg().database_url); repo.init()
     if args.cmd=='init-db': print('initialized')
     elif args.cmd=='db:migrate': print(json.dumps(db_migrate(),indent=2))

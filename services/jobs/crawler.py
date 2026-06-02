@@ -780,3 +780,36 @@ def crawl_jobs_sync(database_url: str, *, seed_urls: list[str] | None = None, jo
     postings = asyncio.run(JobsCrawler().crawl(seed_urls=seed_urls or [], job_type=job_type, query=query))
     saved = JobsRepository(database_url).upsert_many(postings)
     return {"discovered": len(postings), "saved": saved}
+
+# Authoritative simple API compatibility requested by production reset.
+async def _jobs_crawl_govt(self):
+    return await self.crawl(
+        seed_urls=[
+            "https://www.sarkariresult.com",
+            "https://rojgarsamachar.gov.in",
+            "https://upsc.gov.in",
+            "https://ssc.nic.in",
+            "https://rrbapply.gov.in",
+            "https://www.ibps.in",
+            "https://sbi.co.in/web/careers",
+        ],
+        job_type="govt",
+    )
+
+
+async def _jobs_crawl_private(self):
+    return await self.crawl(seed_urls=["https://unstop.com"], job_type="private")
+
+
+async def _jobs_crawl_internships(self):
+    return await self.crawl(seed_urls=["https://internshala.com"], job_type="internship")
+
+
+async def _jobs_crawl_all(self):
+    return [*(await self.crawl_govt()), *(await self.crawl_private()), *(await self.crawl_internships())]
+
+
+JobsCrawler.crawl_govt = _jobs_crawl_govt
+JobsCrawler.crawl_private = _jobs_crawl_private
+JobsCrawler.crawl_internships = _jobs_crawl_internships
+JobsCrawler.crawl_all = _jobs_crawl_all
