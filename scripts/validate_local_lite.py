@@ -7,7 +7,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-REPORT = Path("docs/local-lite-verification-report.md")
+REPORT = Path("local-lite-verification-report.md")
 
 
 def run(cmd: str) -> tuple[bool, str]:
@@ -36,7 +36,7 @@ def main() -> int:
         checks.append(("health",) + run("curl -fsS http://127.0.0.1:8000/health"))
         checks.append(("health-db",) + run("curl -fsS http://127.0.0.1:8000/health/db"))
         checks.append(("health-redis",) + run("curl -fsS http://127.0.0.1:8000/health/redis"))
-        checks.append(("health-webclaw",) + run("curl -fsS http://127.0.0.1:8000/health/webclaw"))
+        checks.append(("health-crawler",) + run("curl -fsS http://127.0.0.1:8000/health/crawler"))
 
     checks.append(("extract-test",) + run("python -m services.lite_pipeline.main extract:test --url https://example.com"))
     checks.append(("crawl-single",) + run("python -m services.lite_pipeline.main crawl:single --url https://example.com"))

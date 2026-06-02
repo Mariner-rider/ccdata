@@ -30,7 +30,7 @@ def parse_size_to_mb(size_text: str) -> float:
 
 def main() -> int:
     allow_large = os.getenv("ALLOW_LARGE_IMAGES", "false").lower() == "true"
-    out_file = Path("docs/docker-size-report.md")
+    out_file = Path("docker-size-report.md")
     lines = ["# Docker Size Report", f"Generated: {datetime.now(timezone.utc).isoformat()}", ""]
 
     try:

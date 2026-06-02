@@ -13,7 +13,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-webclaw = ["httpx==0.28.1", "tenacity==9.1.2"]
 postgres = ["psycopg[binary]==3.2.3"]
 redis = ["redis==5.2.1", "rq==1.16.2"]
 browser = ["playwright==1.54.0"]
