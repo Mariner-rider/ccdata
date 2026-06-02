@@ -16,8 +16,8 @@ Install options:
 uv sync
 uv sync --extra dev
 # or pip fallback
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
+pip install -e .
+pip install -e ".[dev,postgres,redis,crawler]"
 ```
 
 ## Local-lite profile
@@ -34,18 +34,16 @@ Excludes:
 - Kafka
 - Airflow
 - Elasticsearch
-- Nutch
-- Playwright
+- - Playwright
 - Selenium
 
 ## Health endpoints
 - `/health`
 - `/health/db`
 - `/health/redis`
-- `/health/webclaw`
+- `/health/crawler`
 
-When `WEBCLAW_ENABLED=false`:
-- `health/webclaw` returns disabled
+Crawler health is exposed at `/health/crawler`.
 - extraction falls back to HTTP+BS4
 
 ## CLI commands
@@ -87,20 +85,13 @@ ALLOW_LARGE_IMAGES=true make docker-size-report
 ```
 
 ## Verification artifacts
-- `docs/docker-size-report.md`
-- `docs/local-lite-verification-report.md`
-
-## Additional docs
-- `docs/optimization-audit.md`
-- `docs/local-lite-setup.md`
-- `docs/docker-optimization.md`
-- `docs/webclaw-integration.md`
-- `docs/data-pipeline.md`
+- `docker-size-report.md`
+- `local-lite-verification-report.md`
 
 ## No-Docker mode
 Use offline profile with SQLite and in-memory queue.
 Run `make init-db`, `make crawl-fixture`, and `make validate-no-docker`.
-WebClaw is optional and disabled by default in this profile.
+The in-repo DeepCrawler is the default crawler in this profile.
 
 ## Phase 5: Controlled real-site crawling
 Use source registry CLI:

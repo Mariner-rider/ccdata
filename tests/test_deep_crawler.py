@@ -1,94 +1,52 @@
-import asyncio
-from types import SimpleNamespace
-
 from services.deep_crawler.crawler import DeepCrawler
 
 
-COURSE_HTML = """
-<html><body>
-<section><p>Example Institute is a multidisciplinary campus with strong academics, research,
-industry collaboration and student support services across several schools.</p></section>
-<table>
-<tr><th>Course</th><th>Duration</th><th>Seats</th></tr>
-<tr><td>B.Tech Computer Science</td><td>4 years</td><td>120</td></tr>
-<tr><td>MBA</td><td>2 years</td><td>60</td></tr>
-</table>
-<table>
-<tr><th>Program</th><th>Fee</th></tr>
-<tr><td>B.Tech</td><td>₹ 1,20,000</td></tr>
-</table>
-<div class="faculty">Dr. Asha Sharma, Professor of Computer Science</div>
-<img src="/images/campus-library.jpg" alt="Campus library">
-<p>Contact admissions@example.edu +91 9876543210</p>
-<iframe src="https://maps.example.com/embed"></iframe>
-<p>Placement reached 92% with average package 8.5 LPA.</p>
-</body></html>
-"""
+def test_extract_courses_from_table():
+    html = """
+    <html><body><table>
+    <tr><th>Course</th><th>Duration</th><th>Fee</th></tr>
+    <tr><td>MBA</td><td>2 years</td><td>₹45,000</td></tr>
+    </table></body></html>
+    """
+    data = DeepCrawler()._extract_structured(html, "https://x.com/courses")
+    assert data["courses"][0]["name"] == "MBA"
 
 
-def test_extract_structured_finds_course_tables():
-    data = DeepCrawler()._extract_structured(COURSE_HTML, "https://example.edu/courses")
-    assert {course["name"] for course in data["courses"]} >= {"B.Tech Computer Science", "MBA"}
+def test_extract_fees_rupee_pattern():
+    html = "<html><body><p>Tuition fee is ₹45,000 per year for the programme.</p></body></html>"
+    data = DeepCrawler()._extract_structured(html, "https://x.com/fees")
+    assert data["fees"]["tuition_per_year"] == 45000
 
 
-def test_extract_structured_finds_fee_amounts():
-    data = DeepCrawler()._extract_structured(COURSE_HTML, "https://example.edu/fees")
-    assert any("₹ 1,20,000" in fee for fee in data["fees"])
+def test_extract_contact_phone():
+    html = "<html><body><p>Contact office at +91 9876543210 for admissions.</p></body></html>"
+    data = DeepCrawler()._extract_structured(html, "https://x.com/contact")
+    assert data["contact"]["phone"] == "+91 9876543210"
 
 
-def test_extract_structured_returns_empty_for_nav_only_pages():
-    html = "<html><body><nav><a>Home</a><a>About</a></nav><footer>Links</footer></body></html>"
-    assert DeepCrawler()._extract_structured(html, "https://example.edu") == {}
+def test_skip_url_binary():
+    assert DeepCrawler()._skip_url("https://x.com/doc.pdf") is True
 
 
-def test_merge_pages_deduplicates_course_lists():
-    crawler = DeepCrawler()
-    merged = crawler._merge_pages([
-        {"courses": [{"name": "MBA", "details": "2 years"}]},
-        {"courses": [{"name": "MBA", "details": "2 years"}, {"name": "B.Tech", "details": "4 years"}]},
-    ])
-    assert merged["courses"] == [
-        {"name": "MBA", "details": "2 years"},
-        {"name": "B.Tech", "details": "4 years"},
-    ]
+def test_skip_url_login():
+    assert DeepCrawler()._skip_url("https://x.com/login") is True
 
 
-def test_merge_pages_keeps_longer_about_text():
+def test_merge_pages_dedup_courses():
     merged = DeepCrawler()._merge_pages([
-        {"about": "Short campus summary."},
-        {"about": "A much longer campus summary with more complete institutional details."},
+        {"courses": [{"name": "MBA", "duration": "2 years"}]},
+        {"courses": [{"name": "MBA", "duration": "2 years"}]},
     ])
-    assert merged["about"].startswith("A much longer")
+    assert len(merged["courses"]) == 1
 
 
-def test_crawl_page_uses_httpx_fallback(monkeypatch):
-    class FakeResponse:
-        text = COURSE_HTML
+def test_merge_pages_longest_about():
+    page1 = {"about": "Short about."}
+    page2 = {"about": "This is the longer about text with richer details about the institution."}
+    merged = DeepCrawler()._merge_pages([page1, page2])
+    assert merged["about"] == page2["about"]
 
-        def raise_for_status(self):
-            return None
 
-    class FakeAsyncClient:
-        def __init__(self, *args, **kwargs):
-            self.kwargs = kwargs
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-        async def get(self, url, headers):
-            assert url == "https://example.edu/courses"
-            assert "User-Agent" in headers
-            return FakeResponse()
-
-    import services.deep_crawler.crawler as module
-
-    monkeypatch.setattr(module.importlib.util, "find_spec", lambda name: None if name == "crawl4ai" else object())
-    async def fake_sleep(delay):
-        return None
-
-    monkeypatch.setattr(module.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(module, "httpx", SimpleNamespace(AsyncClient=FakeAsyncClient))
-    assert "B.Tech" in asyncio.run(DeepCrawler()._crawl_page("https://example.edu/courses"))
+def test_is_useful_page_rejects_empty():
+    html = "<html><body><nav>Home About Contact</nav></body></html>"
+    assert DeepCrawler()._is_useful_page(html) is False

@@ -1,8 +1,8 @@
 install:
-	pip install -r requirements.txt
+	pip install -e .
 
 install-dev:
-	pip install -r requirements-dev.txt
+	pip install -e ".[dev,postgres,redis,crawler]"
 
 test:
 	pytest -q
@@ -14,4 +14,4 @@ init-db:
 	RUNTIME_PROFILE=no-docker DATABASE_URL=sqlite:///./collegecue_local.db python -m services.lite_pipeline.main init-db
 
 crawl-fixture:
-	RUNTIME_PROFILE=no-docker DATABASE_URL=sqlite:///./collegecue_local.db QUEUE_BACKEND=memory WEBCLAW_ENABLED=false python -m services.lite_pipeline.main crawl:single --url file://tests/fixtures/college_sample.html
+	RUNTIME_PROFILE=no-docker DATABASE_URL=sqlite:///./collegecue_local.db QUEUE_BACKEND=memory python -m services.lite_pipeline.main crawl:single --url file://tests/fixtures/college_sample.html

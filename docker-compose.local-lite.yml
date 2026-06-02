@@ -34,8 +34,6 @@ services:
     environment:
       POSTGRES_DSN: postgresql://crawler:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/crawler
       REDIS_URL: redis://redis:6379/0
-      WEBCLAW_ENABLED: "true"
-      WEBCLAW_BASE_URL: ${WEBCLAW_BASE_URL:-}
       DEBUG_RAW_HTML: "false"
       RAW_HTML_RETENTION_DAYS: 7
       SERVICE_API_KEY: ${SERVICE_API_KEY:?SERVICE_API_KEY must be set}
@@ -57,12 +55,14 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
-    command: python -m services.lite_pipeline.main crawl:missing-fields
+    command: python -m services.lite_pipeline.main source:deep-crawl-all
     environment:
       POSTGRES_DSN: postgresql://crawler:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/crawler
       REDIS_URL: redis://redis:6379/0
-      WEBCLAW_ENABLED: "true"
-      WEBCLAW_BASE_URL: ${WEBCLAW_BASE_URL:-}
+      CRAWL_MAX_PAGES_PER_SOURCE: ${CRAWL_MAX_PAGES_PER_SOURCE:-40}
+      CRAWL_RATE_LIMIT_SECONDS: ${CRAWL_RATE_LIMIT_SECONDS:-1.5}
+      CRAWL_TIMEOUT_SECONDS: ${CRAWL_TIMEOUT_SECONDS:-30}
+      CRAWL_MAX_RETRIES: ${CRAWL_MAX_RETRIES:-3}
       SERVICE_API_KEY: ${SERVICE_API_KEY:?SERVICE_API_KEY must be set}
     depends_on:
       postgres:

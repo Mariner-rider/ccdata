@@ -74,6 +74,10 @@ else:
             return dict(self.__dict__)
 
 
+
+from services.test_series.models import TestSeries
+from services.test_series.repository import QuestionRepository, TestSeriesRepository
+
 from services.lite_pipeline.main import (
     Repo,
     _cfg,
@@ -140,6 +144,52 @@ def _guard(key):
         raise HTTPException(status_code=401, detail="invalid admin api key")
 
 
+
+
+class TestCreateIn(BaseModel):
+    name: str
+    exam_type: str
+    description: str = ""
+    duration_minutes: int = 60
+    difficulty_mix: dict[str, int]
+    exclude_student_id: str | None = None
+
+
+class TestSubmitIn(BaseModel):
+    student_id: str
+    answers: dict[str, str]
+
+
+class QuestionCrawlIn(BaseModel):
+    exam_type: str
+
+
+def _public_question(question):
+    return {
+        "id": question.id,
+        "question_text": question.question_text,
+        "option_a": question.option_a,
+        "option_b": question.option_b,
+        "option_c": question.option_c,
+        "option_d": question.option_d,
+        "exam_type": question.exam_type,
+        "subject": question.subject,
+        "topic": question.topic,
+        "difficulty": question.difficulty,
+        "language": question.language,
+        "year": question.year,
+    }
+
+
+def _question_with_answer(question):
+    data = _public_question(question)
+    data["correct_option"] = question.correct_option
+    data["explanation"] = question.explanation
+    data["source_url"] = question.source_url
+    data["source_site"] = question.source_site
+    data["is_verified"] = question.is_verified
+    return data
+
 class SourceIn(BaseModel):
     entity_type: str = "college"
     entity_name: str
@@ -151,6 +201,12 @@ class SourceIn(BaseModel):
 def health():
     return {"status": "ok"}
 
+
+
+
+@app.get("/health/crawler")
+def crawler_health():
+    return {"status": "ok" if find_spec("crawl4ai") is not None else "unavailable", "crawl4ai_importable": find_spec("crawl4ai") is not None}
 
 @app.get("/robots.txt", response_class=PlainTextResponse)
 def robots_txt():
@@ -192,6 +248,131 @@ def crawl(
 ):
     _guard(x_api_key)
     return enqueue_job(id, "crawl", dry_run, 5, None, idempotency_key)
+
+
+
+
+# ── Practice Questions (public, no auth) ─────────────
+@app.get("/practice")
+async def practice_questions(
+    exam: str,
+    difficulty: str,
+    subject: str | None = None,
+    count: int = 20,
+    student_id: str | None = None,
+):
+    repo = QuestionRepository()
+    safe_count = max(1, min(count, 50))
+    history_ids = await repo.get_student_history(student_id) if student_id else []
+    questions = await repo.get_practice_questions(exam, subject, difficulty, safe_count, history_ids)
+    if student_id:
+        await repo.record_student_history(student_id, [q.id for q in questions if q.id])
+    return {"questions": [_public_question(question) for question in questions]}
+
+
+@app.get("/practice/{question_id}/answer")
+async def practice_answer(question_id: int, student_id: str):
+    repo = QuestionRepository()
+    history_ids = await repo.get_student_history(student_id)
+    if question_id not in history_ids:
+        raise HTTPException(status_code=403, detail="question was not served to this student")
+    question = await repo.get(question_id)
+    if not question:
+        raise HTTPException(status_code=404, detail="question not found")
+    return {"question_id": question_id, "correct_option": question.correct_option, "explanation": question.explanation}
+
+
+# ── Test Series (public read) ─────────────────────────
+@app.get("/tests")
+async def list_tests():
+    tests = await TestSeriesRepository().list_active()
+    return {"results": [test.__dict__ for test in tests]}
+
+
+@app.get("/tests/{id}")
+async def get_test(id: int):
+    repo = TestSeriesRepository()
+    test = await repo.get(id)
+    if not test:
+        raise HTTPException(status_code=404, detail="test not found")
+    questions = await repo.get_questions(id)
+    data = test.__dict__.copy()
+    data["question_count"] = len(questions)
+    return data
+
+
+@app.get("/tests/{id}/questions")
+async def get_test_questions(id: int):
+    questions = await TestSeriesRepository().get_questions(id)
+    return {"questions": [_public_question(question) for question in questions]}
+
+
+@app.post("/tests/{id}/submit")
+async def submit_test(id: int, body: TestSubmitIn):
+    q_repo = QuestionRepository()
+    questions = await TestSeriesRepository().get_questions(id)
+    answer_map = {str(question.id): question.correct_option for question in questions}
+    correct_ids = [int(qid) for qid, answer in body.answers.items() if answer_map.get(str(qid)) == str(answer).lower()]
+    explanation_map = {
+        str(question.id): {"correct_option": question.correct_option, "explanation": question.explanation}
+        for question in questions
+        if question.id is not None
+    }
+    score = len(correct_ids)
+    total = len(questions)
+    await q_repo.record_attempt(body.student_id, id, score, total, body.answers)
+    return {"score": score, "total": total, "correct_ids": correct_ids, "explanation_map": explanation_map}
+
+
+# ── Admin endpoints (require X-API-Key header) ────────
+@app.post("/admin/tests")
+async def create_admin_test(body: TestCreateIn, x_api_key: str | None = Header(default=None)):
+    _guard(x_api_key)
+    q_repo = QuestionRepository()
+    t_repo = TestSeriesRepository()
+    exclude_ids = await q_repo.get_student_history(body.exclude_student_id) if body.exclude_student_id else []
+    questions = await q_repo.get_for_test(body.exam_type, body.difficulty_mix, exclude_ids)
+    test_id = await t_repo.create(
+        TestSeries(
+            id=None,
+            name=body.name,
+            exam_type=body.exam_type,
+            description=body.description,
+            total_questions=len(questions),
+            duration_minutes=body.duration_minutes,
+            created_by="admin",
+            is_active=True,
+            created_at=None,
+        )
+    )
+    await t_repo.add_questions(test_id, [question.id for question in questions if question.id])
+    return {"test_id": test_id, "questions_selected": len(questions)}
+
+
+@app.get("/admin/questions")
+async def admin_questions(
+    exam: str | None = None,
+    difficulty: str | None = None,
+    unverified: bool = False,
+    x_api_key: str | None = Header(default=None),
+):
+    _guard(x_api_key)
+    questions = await QuestionRepository().list_questions(exam, difficulty, unverified, 100)
+    return {"questions": [_question_with_answer(question) for question in questions]}
+
+
+@app.post("/admin/questions/{id}/verify")
+async def verify_question(id: int, x_api_key: str | None = Header(default=None)):
+    _guard(x_api_key)
+    await QuestionRepository().mark_verified(id)
+    return {"ok": True, "question_id": id}
+
+
+@app.post("/admin/crawl/questions")
+async def crawl_questions(body: QuestionCrawlIn, x_api_key: str | None = Header(default=None)):
+    _guard(x_api_key)
+    job = enqueue_job(None, "question_crawl", False, 50, {"exam_type": body.exam_type})
+    return {"job_id": job["job_id"] if "job_id" in job else job.get("id"), "exam_type": body.exam_type}
 
 
 @app.get("/review")

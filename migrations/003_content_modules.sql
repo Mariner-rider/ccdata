@@ -1,0 +1,1 @@
+-- Admissions, jobs, news, and research schema are maintained by existing dated migrations.

@@ -1,0 +1,1 @@
+-- Baseline migration marker for the consolidated production schema.
