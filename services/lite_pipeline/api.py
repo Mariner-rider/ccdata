@@ -152,6 +152,12 @@ def health():
     return {"status": "ok"}
 
 
+
+
+@app.get("/health/crawler")
+def crawler_health():
+    return {"status": "ok" if find_spec("crawl4ai") is not None else "unavailable", "crawl4ai_importable": find_spec("crawl4ai") is not None}
+
 @app.get("/robots.txt", response_class=PlainTextResponse)
 def robots_txt():
     return "User-agent: *\nDisallow: /admin/\nDisallow: /internal/\nAllow: /public/\nAllow: /search\n"

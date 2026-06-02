@@ -7,13 +7,13 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from urllib import robotparser
 from services.common.user_agents import add_jitter, get_random_ua
-from services.extraction.webclaw_adapter.fallback_extractor import extract_fallback
+from services.extraction.html_fallback_extractor import extract_fallback
 from services.institutions.crawler import crawl_institution_sync, read_bulk_csv
 from services.admissions.crawler import AdmissionsRepository, SQLITE_CREATE_ADMISSIONS, crawl_admissions_sync
 from services.jobs.crawler import JobsRepository, SQLITE_CREATE_JOBS, crawl_jobs_sync
 from services.news.crawler import NewsRepository, SQLITE_CREATE_INSTITUTIONS, SQLITE_CREATE_NEWS, crawl_news_sync
 from services.research.crawler import ResearchRepository, SQLITE_CREATE_RESEARCH, crawl_research_sync
-from services.deep_crawler.crawler import DeepCrawler
+from services.deep_crawler.crawler import CRAWL4AI_AVAILABLE, PRIORITY_PATHS, DeepCrawler, crawl_institution
 try:
     import psycopg
 except Exception:
@@ -171,7 +171,7 @@ class Repo:
                     if ov!=v: changes.append({"field_name":k,"old_value":ov,"new_value":v,"timestamp":datetime.now(timezone.utc).isoformat()})
                 rec['change_log']=changes
                 c.execute("UPDATE crawler_records SET payload=?,missing_fields=?,confidence_score=?,content_hash=?,last_crawled_at=? WHERE id=?",(json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['content_hash'],rec['last_crawled_at'],row[0])); c.commit(); return 'updated'
-            state='draft' if (not rec['missing_fields'] and rec['confidence_score']>=0.85) else 'needs_review'
+            state=rec.get('lifecycle_state') or ('draft' if (not rec['missing_fields'] and rec['confidence_score']>=0.85) else 'needs_review')
             rec['lifecycle_state']=state
             c.execute("INSERT INTO crawler_records(source_id,canonical_entity_id,entity_type,title,source_url,official_url,payload,missing_fields,confidence_score,trust_tier,content_hash,last_crawled_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(rec.get('source_id'),rec.get('canonical_entity_id'),rec['entity_type'],rec['title'],rec['source_url'],rec['official_url'],json.dumps(rec),json.dumps(rec['missing_fields']),rec['confidence_score'],rec['trust_tier'],rec['content_hash'],rec['last_crawled_at']))
             rid=c.execute('select last_insert_rowid()').fetchone()[0]
@@ -338,91 +338,135 @@ def _upsert_public_entity(c, entity_record_id, source_id, entity_type, rec, vers
     else:
         c.execute('insert into public_entities(entity_record_id,source_id,entity_type,title,slug,location,country,summary,page_json,search_text,confidence_score,lifecycle_state,published_version,canonical_entity_id,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(entity_record_id,source_id,entity_type,title,slug,location,country,summary,page_json,search_text,rec.get('confidence_score'),rec.get('lifecycle_state'),version,rec.get('canonical_entity_id'),now,now))
 
-def crawl_source(id,dry=False):
-    cfg=_cfg(); repo=Repo(cfg.database_url); repo.init(); sid,etype,name,url,trust=repo.get_source(id)
-    plan=discover(url,cfg,repo); pages=[]
-    for p in plan:
-        if not p['robots_allowed']: repo.log(p['url'],'blocked','robots'); continue
-        try: pages.append({"url":p['url'],"extract":_fetch_extract_resilient(p['url'], timeout=cfg.timeout),"page_type":p['page_type']})
-        except Exception as e:
-            m=str(e)
-            if 'blocked:403' in m: repo.log(p['url'],'blocked','403')
-            elif 'cooldown:429' in m: repo.log(p['url'],'cooldown','429')
-            else: repo.log(p['url'],'error',m)
-    rec=merge_pages(etype,name,url,pages,trust); rec['source_id']=sid; rec['canonical_entity_id']=_canonical_sig(rec)
-    with sqlite3.connect(repo.path) as c:
-        dup=c.execute('select id from crawler_records where canonical_entity_id=? and source_id!=? limit 1',(rec['canonical_entity_id'],sid)).fetchone()
-    if dup: rec['duplicate_of']=dup[0]
-    req=REQ_BY_TYPE.get(etype,REQ_COLLEGE)
-    if etype=='college':
-        valid=rec['confidence_score']>=0.65 and (1-len(rec['missing_fields'])/max(1,len(req)))>=0.7 and rec['trust_tier'] in TRUST and rec['content_hash']
-    else:
-        valid=bool(rec.get('content_hash')) and rec['trust_tier'] in TRUST
-    qr=quality_report(plan,pages,rec,'pass' if valid else 'fail','quality_gate_failed' if not valid else '')
-    if dry: return {"dry_run":True,"quality_report":qr,"record":rec}
-    st=repo.save_entity(rec) if valid else (repo.save_quarantine(url,rec,'quality_gate_failed') or 'quarantined')
-    if st in {'created','updated','unchanged'}:
-        with sqlite3.connect(repo.path) as c:
-            c.execute('UPDATE source_registry SET last_crawled_at=?,updated_at=? WHERE id=?',(datetime.now(timezone.utc).isoformat(),datetime.now(timezone.utc).isoformat(),sid)); c.commit()
-    return {"source_id":sid,"status":st,"quality_report":qr}
-
-
 def _deep_profile_to_record(sid, etype, name, url, trust, profile):
     fields = {
-        "name": name,
+        "name": name or profile.get("name", ""),
         "official_website": url,
         "about": profile.get("about", ""),
         "courses": profile.get("courses", []),
-        "fees": profile.get("fees", []),
+        "fees": profile.get("fees", {}),
         "faculty": profile.get("faculty", []),
         "gallery": profile.get("images", []),
+        "hostel": profile.get("hostel", {}),
         "contact": profile.get("contact", {}),
-        "placement": profile.get("placement_stats", []),
+        "placement": profile.get("placement", {}),
+        "rankings": profile.get("rankings", []),
+        "accreditation": profile.get("accreditation", []),
     }
     missing = [field for field in ["about", "courses", "fees", "faculty", "contact"] if not fields.get(field)]
     confidence = round((1 - len(missing) / 5) * 0.7 + TRUST.get(trust, 0.6) * 0.3, 3)
     rec = {
         "entity_type": etype,
-        "title": name,
+        "title": fields["name"] or name,
         "source_url": url,
         "official_url": url,
         "fields": fields,
-        "metadata": {"deep_crawl": True, "page_count": profile.get("pages_crawled", 0)},
+        "metadata": {"deep_crawl": True, "page_count": profile.get("pages_crawled", 0), "field_sources": {}},
         "missing_fields": missing,
         "confidence_score": confidence,
         "trust_tier": trust,
         "content_hash": hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest(),
         "last_crawled_at": datetime.now(timezone.utc).isoformat(),
         "source_id": sid,
+        "lifecycle_state": "pending_review",
     }
     rec["canonical_entity_id"] = _canonical_sig(rec)
     return rec
 
 
-def deep_crawl_source(source_id, max_pages=40, dry_run=False):
+def deep_crawl_source(source_id, max_pages=None, dry_run=False):
     cfg = _cfg()
     repo = Repo(cfg.database_url)
     repo.init()
     sid, etype, name, url, trust = repo.get_source(source_id)
-    profile = asyncio.run(DeepCrawler().crawl_institution(url, etype, max_pages=max_pages))
-    if not profile:
-        return {"source_id": sid, "status": "empty", "record": {}}
+    max_pages = max_pages or int(os.getenv("CRAWL_MAX_PAGES_PER_SOURCE", "40"))
+    rate_limit = float(os.getenv("CRAWL_RATE_LIMIT_SECONDS", "1.5"))
+    profile = asyncio.run(crawl_institution(url, etype, max_pages=max_pages, rate_limit_seconds=rate_limit))
     rec = _deep_profile_to_record(sid, etype, name, url, trust, profile)
     if dry_run:
-        return {"source_id": sid, "dry_run": True, "record": rec}
+        return {"source_id": sid, "dry_run": True, "record": rec, "profile": profile}
     status = repo.save_entity(rec)
-    return {"source_id": sid, "status": status, "record": rec}
+    with sqlite3.connect(repo.path) as c:
+        c.execute('UPDATE source_registry SET last_crawled_at=?,updated_at=? WHERE id=?',(datetime.now(timezone.utc).isoformat(),datetime.now(timezone.utc).isoformat(),sid)); c.commit()
+    return {"source_id": sid, "status": "pending_review" if status in {"created", "updated", "unchanged"} else status, "record": rec}
 
 
-def deep_crawl_all(max_pages=40, dry_run=False):
+def deep_crawl_all(max_pages=None, dry_run=False):
     repo = Repo(_cfg().database_url)
     repo.init()
-    results = []
-    for source in repo.list_sources():
-        if not source[5]:
+    daily_max = int(os.getenv("DAILY_MAX_JOBS", "500"))
+    freshness_days = int(os.getenv("FRESHNESS_DAYS_THRESHOLD", "7"))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=freshness_days)
+    with sqlite3.connect(repo.path) as c:
+        rows = c.execute("SELECT id,entity_type,entity_name,official_url,trust_tier,is_active,last_crawled_at FROM source_registry WHERE is_active=1").fetchall()
+    due = []
+    for row in rows:
+        last = row[6]
+        if not last:
+            due.append(row)
             continue
+        try:
+            last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            due.append(row)
+            continue
+        if last_dt < cutoff:
+            due.append(row)
+    due = due[:daily_max]
+    results = []
+    total = len(due)
+    for index, source in enumerate(due, start=1):
         results.append(deep_crawl_source(source[0], max_pages=max_pages, dry_run=dry_run))
+        print(f"Crawled {index}/{total} sources")
     return {"count": len(results), "results": results}
+
+
+def crawl_source(id,dry=False):
+    return deep_crawl_source(id, max_pages=int(os.getenv("CRAWL_MAX_PAGES_PER_SOURCE", "40")), dry_run=dry)
+
+
+def preview_source(source_id):
+    repo = Repo(_cfg().database_url)
+    repo.init()
+    _, _, _, url, _ = repo.get_source(source_id)
+    crawler = DeepCrawler(max_pages=int(os.getenv("CRAWL_MAX_PAGES_PER_SOURCE", "40")))
+    crawler._base_url = url
+    crawler._base_netloc = urlparse(url).netloc.lower()
+    js_required = asyncio.run(crawler._detect_js_required(url))
+    priority_found = []
+    root = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    for path in PRIORITY_PATHS:
+        target = urljoin(root, path)
+        try:
+            response = __import__("httpx").get(target, headers=__import__("services.common.user_agents", fromlist=["get_headers"]).get_headers(target), timeout=5, follow_redirects=True)
+            if response.status_code < 400:
+                priority_found.append(path)
+        except Exception:
+            continue
+    disallowed = []
+    try:
+        robots_url = urljoin(root, "/robots.txt")
+        response = __import__("httpx").get(robots_url, headers=__import__("services.common.user_agents", fromlist=["get_headers"]).get_headers(robots_url), timeout=5, follow_redirects=True)
+        if response.status_code < 400:
+            disallowed = [line.split(":", 1)[1].strip() for line in response.text.splitlines() if line.lower().startswith("disallow:") and line.split(":", 1)[1].strip()]
+    except Exception:
+        disallowed = []
+    return {
+        "source_id": source_id,
+        "domain": urlparse(url).netloc,
+        "js_required": "yes" if js_required else "no",
+        "priority_paths_found": priority_found,
+        "estimated_pages_to_crawl": min(crawler.max_pages, 1 + len(priority_found)),
+        "robots_txt_disallowed_paths": disallowed,
+    }
+
+
+def crawl_single(url, entity_type="college"):
+    max_pages = int(os.getenv("CRAWL_MAX_PAGES_PER_SOURCE", "40"))
+    rate_limit = float(os.getenv("CRAWL_RATE_LIMIT_SECONDS", "1.5"))
+    return asyncio.run(crawl_institution(url, entity_type, max_pages=max_pages, rate_limit_seconds=rate_limit))
 
 
 def research_items_list(field=None,item_type=None,year=None,institution_id=None,limit=100):
@@ -547,7 +591,7 @@ def readiness_check():
         pending=0
         quarantine=c.execute('select count(*) from quarantine_records').fetchone()[0]
         errs=c.execute("select count(*) from crawl_logs where status='error'").fetchone()[0]
-    return {"deps":{"sqlite3":True,"httpx_optional":True},"runtime_profile":os.getenv('RUNTIME_PROFILE','no-docker'),"db_connectivity":True,"queue_backend":os.getenv('QUEUE_BACKEND','memory'),"webclaw_enabled":os.getenv('WEBCLAW_ENABLED','false'),"crawler_limits":{"max_pages":cfg.max_pages,"timeout":cfg.timeout,"same_domain":cfg.same_domain},"allowed_domains":sorted(cfg.allowlist),"storage_status":{"db_path":repo.path},"pending_crawl_tasks":pending,"quarantine_count":quarantine,"last_crawl_log_errors":errs}
+    return {"deps":{"sqlite3":True,"httpx_optional":True},"runtime_profile":os.getenv('RUNTIME_PROFILE','no-docker'),"db_connectivity":True,"queue_backend":os.getenv('QUEUE_BACKEND','memory'),"crawler_available":True,"crawler_limits":{"max_pages":cfg.max_pages,"timeout":cfg.timeout,"same_domain":cfg.same_domain},"allowed_domains":sorted(cfg.allowlist),"storage_status":{"db_path":repo.path},"pending_crawl_tasks":pending,"quarantine_count":quarantine,"last_crawl_log_errors":errs}
 
 def audit_export():
     repo=Repo(_cfg().database_url); repo.init()
@@ -956,6 +1000,7 @@ def main():
     c=sub.add_parser('source:crawl'); c.add_argument('--id',type=int,required=True); c.add_argument('--dry-run',action='store_true')
     dc=sub.add_parser('source:deep-crawl'); dc.add_argument('--id',type=int,required=True); dc.add_argument('--max-pages',type=int,default=40); dc.add_argument('--dry-run',action='store_true')
     dca=sub.add_parser('source:deep-crawl-all'); dca.add_argument('--max-pages',type=int,default=40); dca.add_argument('--dry-run',action='store_true')
+    cs=sub.add_parser('crawl:single'); cs.add_argument('--url',required=True); cs.add_argument('--entity-type',default='college')
     e=sub.add_parser('export:entity'); e.add_argument('--id',type=int,required=True); e.add_argument('--format',default='json')
     t=sub.add_parser('extract:test'); t.add_argument('--url',required=True)
     d=sub.add_parser('extract:debug'); d.add_argument('--url',required=True)
@@ -1020,10 +1065,11 @@ def main():
         if args.trigger_crawl: print(json.dumps(enqueue_job(sid,'crawl',False,5),indent=2))
     elif args.cmd=='search': print(json.dumps(_search(args.query,args.entity_type,args.location,args.country),indent=2))
     elif args.cmd=='source:list': print(json.dumps([{"id":r[0],"entity_type":r[1],"entity_name":r[2],"official_url":r[3],"trust_tier":r[4],"is_active":r[5]} for r in repo.list_sources()],indent=2))
-    elif args.cmd=='source:preview': s=repo.get_source(args.id); plan=discover(s[3],_cfg(),repo); deep_estimate=min(40, 1+len(DeepCrawler.PRIORITY_PATHS)); print(json.dumps({"source_id":args.id,"estimated_page_count":len(plan),"estimated_deep_page_count":deep_estimate,"urls":plan,"quality_report":{"pages_discovered":len(plan)}},indent=2))
+    elif args.cmd=='source:preview': print(json.dumps(preview_source(args.id),indent=2))
     elif args.cmd=='source:crawl': print(json.dumps(crawl_source(args.id,args.dry_run),indent=2))
     elif args.cmd=='source:deep-crawl': print(json.dumps(deep_crawl_source(args.id,args.max_pages,args.dry_run),indent=2))
     elif args.cmd=='source:deep-crawl-all': print(json.dumps(deep_crawl_all(args.max_pages,args.dry_run),indent=2))
+    elif args.cmd=='crawl:single': print(json.dumps(crawl_single(args.url,args.entity_type),indent=2))
     elif args.cmd=='export:entity': print(json.dumps(export_entity(args.id),indent=2))
     elif args.cmd=='extract:test': print(json.dumps(extract_fallback(args.url),indent=2))
     elif args.cmd=='extract:debug': ex=extract_fallback(args.url); rec=merge_pages('college','debug',args.url,[{"url":args.url,"extract":ex,"page_type":"homepage"}],'official'); print(json.dumps({"detected_sections":ex.get('sections',{}),"extracted_fields":ex.get('field_details',{}),"missing_fields":rec['missing_fields'],"final_normalized_record":rec},indent=2))

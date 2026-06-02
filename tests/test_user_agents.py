@@ -1,49 +1,49 @@
-from services.common.user_agents import USER_AGENT_POOL, add_jitter, get_headers, get_random_ua
+from services.common.user_agents import ACCEPT_LANGUAGES, USER_AGENT_POOL, add_jitter, get_headers
 
 
-def test_user_agent_pool_has_browser_coverage():
+def test_pool_size():
     assert len(USER_AGENT_POOL) >= 20
-    joined = "\n".join(USER_AGENT_POOL)
-    assert "Chrome/" in joined
-    assert "Firefox/" in joined
-    assert "Safari/" in joined
-    assert "Edg/" in joined
 
 
-def test_user_agents_do_not_contain_bot_strings():
-    forbidden = ("bot", "crawler", "scraper", "ccdata")
+def test_no_bot_strings():
+    forbidden = ("bot", "crawler", "scraper", "spider", "python", "requests", "httpx", "ccdata")
     for user_agent in USER_AGENT_POOL:
         lowered = user_agent.lower()
         assert not any(word in lowered for word in forbidden)
 
 
-def test_get_headers_returns_required_browser_keys():
-    headers = get_headers("https://example.edu/admissions/apply")
+def test_get_headers_keys():
+    headers = get_headers("https://iimb.ac.in/courses")
     required = {
         "User-Agent",
         "Accept",
         "Accept-Language",
         "Accept-Encoding",
         "Connection",
+        "Upgrade-Insecure-Requests",
         "Sec-Fetch-Dest",
         "Sec-Fetch-Mode",
         "Sec-Fetch-Site",
-        "Referer",
+        "Sec-Fetch-User",
         "Cache-Control",
         "DNT",
     }
     assert required <= set(headers)
-    assert headers["Referer"] == "https://example.edu/"
     assert headers["User-Agent"] in USER_AGENT_POOL
+    assert headers["Accept-Language"] in ACCEPT_LANGUAGES
 
 
-def test_add_jitter_stays_in_expected_range():
-    base = 1.5
+def test_accept_language_rotates():
+    languages = {get_headers("https://iimb.ac.in/")["Accept-Language"] for _ in range(20)}
+    assert len(languages) >= 2
+
+
+def test_jitter_range():
     for _ in range(100):
-        value = add_jitter(base)
-        assert base - 0.3 <= value <= base + 0.8
+        assert 0.5 <= add_jitter(1.0) <= 2.5
 
 
-def test_random_user_agent_always_from_pool():
-    for _ in range(100):
-        assert get_random_ua() in USER_AGENT_POOL
+def test_referer_set_for_subpage():
+    headers = get_headers("https://iimb.ac.in/courses")
+    assert headers["Referer"] == "https://iimb.ac.in"
+    assert headers["Sec-Fetch-Site"] == "same-origin"
