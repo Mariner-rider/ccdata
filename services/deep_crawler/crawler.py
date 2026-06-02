@@ -358,7 +358,7 @@ class DeepCrawler:
     def _robots_allowed(self, url: str) -> bool:
         """Return whether robots.txt allows fetching the URL."""
         parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"}:
+        if self._base_netloc and parsed.netloc and parsed.netloc.lower() != self._base_netloc:
             return True
         try:
             robots = robotparser.RobotFileParser(f"{parsed.scheme}://{parsed.netloc}/robots.txt")
